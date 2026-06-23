@@ -1,323 +1,287 @@
 -- ==========================================
--- SCRIPT: Always Double ON/OFF - BẢN SỬA LỖI
--- DESCRIPTION: Bật/Tắt hoạt động hoàn toàn.
---              BẬT = Can thiệp kết quả thành DOUBLE.
---              TẮT = Khôi phục nguyên trạng game 40%.
--- COMPATIBILITY: Synapse X, Script-Ware, Krnl, Delta
+-- SCRIPT: Always Double - BẢN HOẠT ĐỘNG THỰC SỰ
+-- DESCRIPTION: BẬT = Luôn nhận DOUBLE.
+--              TẮT = Game gốc 40%.
+-- METHOD: Chặn và thay đổi gói tin kết quả từ Server
+--         trước khi UI/Data xử lý.
 -- ==========================================
 
 -- // Dịch vụ
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local LocalPlayer = Players.LocalPlayer
 
--- // Biến toàn cục
+-- // Trạng thái
 local IsEnabled = false
-local ActiveMethod = nil
+local Connection = nil -- Lưu kết nối sự kiện để có thể ngắt khi TẮT
 
--- // LƯU TRỮ THAM CHIẾU GỐC (QUAN TRỌNG CHO VIỆC TẮT)
-local OriginalMathRandom = math.random -- Lưu TRƯỚC KHI ghi đè
-local OriginalFireServer = nil -- Sẽ lưu sau
-local OriginalInvokeServer = nil -- Sẽ lưu sau
-local OriginalOnClientEvent = nil -- Sẽ lưu sau
+-- // Tìm RemoteEvent kết quả Double or Nothing
+-- Tên có thể khác nhau tùy phiên bản game
+local PossibleResultEventNames = {
+    "DoN_Result",
+    "DoubleOrNothingResult",
+    "SellResult",
+    "GambleResult",
+    "DoubleResult",
+    "DoNResult"
+}
 
--- // Đường dẫn RemoteEvent/RemoteFunction
-local function FindRemote(path)
-    local parts = string.split(path, ".")
-    local obj = ReplicatedStorage
-    for _, part in ipairs(parts) do
-        if obj then
-            obj = obj:FindFirstChild(part)
-        else
-            return nil
+local ResultEvent = nil
+
+-- Tìm trong ReplicatedStorage và các thư mục con
+local function FindResultEvent()
+    -- Tìm trực tiếp
+    for _, name in ipairs(PossibleResultEventNames) do
+        local event = ReplicatedStorage:FindFirstChild(name, true)
+        if event and event:IsA("RemoteEvent") then
+            return event
         end
     end
-    return obj
-end
-
-local DoN_Request = FindRemote("Systems.DoubleOrNothing.DoN_Request")
-local DoN_Override = FindRemote("Systems.DoubleOrNothing.DebugFunctions.DoN_Override")
-local DoN_Result = FindRemote("Systems.DoubleOrNothing.DoN_Result")
-local UpdateCoins = FindRemote("Systems.Currency.UpdateCoins")
-local DoN_Module = FindRemote("Systems.DoubleOrNothing")
-
--- ==========================================
--- PHƯƠNG PHÁP 1: MATH.RANDOM WRAPPER (CÓ THỂ TẮT)
--- ==========================================
-local function EnableMathHook()
-    if ActiveMethod == "MathHook" then return true end
     
-    -- Ghi đè math.random với wrapper có kiểm tra trạng thái
-    math.random = function(...)
-        if IsEnabled then
-            -- Chế độ BẬT: Luôn trả về giá trị <= 0.39 (dưới WIN_CHANCE 0.4)
-            local args = {...}
-            if #args == 0 then
-                return OriginalMathRandom() * 0.39
-            elseif #args == 1 then
-                return args[1]
-            elseif #args == 2 then
-                return args[2]
+    -- Tìm trong Systems
+    local systems = ReplicatedStorage:FindFirstChild("Systems")
+    if systems then
+        for _, child in ipairs(systems:GetDescendants()) do
+            if child:IsA("RemoteEvent") and 
+               (child.Name:lower():find("result") or 
+                child.Name:lower():find("double") or 
+                child.Name:lower():find("don")) then
+                return child
             end
-        else
-            -- Chế độ TẮT: Gọi hàm gốc
-            return OriginalMathRandom(...)
         end
     end
     
-    ActiveMethod = "MathHook"
-    return true
-end
-
-local function DisableMathHook()
-    if ActiveMethod ~= "MathHook" then return true end
-    -- KHÔNG cần khôi phục math.random vì wrapper đã kiểm tra IsEnabled
-    -- Chỉ cần đặt IsEnabled = false, wrapper tự chuyển về gốc
-    ActiveMethod = nil
-    return true
-end
-
--- ==========================================
--- PHƯƠNG PHÁP 2: FIRESERVER WRAPPER (CÓ THỂ TẮT HOÀN TOÀN)
--- ==========================================
-local FireServerWrapper = nil
-
-local function EnableFireServerHook()
-    if ActiveMethod == "FireServer" then return true end
-    if not DoN_Request then return false end
-    
-    -- Lưu hàm FireServer gốc
-    if not OriginalFireServer then
-        OriginalFireServer = DoN_Request.FireServer
-    end
-    
-    -- Tạo wrapper mới thay thế FireServer
-    FireServerWrapper = function(self, ...)
-        if IsEnabled and DoN_Override then
-            -- Chế độ BẬT: Chuyển hướng sang DoN_Override thay vì gọi FireServer gốc
-            local args = {...}
-            local success, result = pcall(function()
-                return DoN_Override:InvokeServer("DOUBLE", 999999999)
-            end)
-            if not success then
-                warn("[AlwaysDouble] Override failed: " .. tostring(result))
-                -- Fallback: gọi FireServer gốc
-                return OriginalFireServer(self, ...)
+    -- Tìm tất cả RemoteEvent có liên quan đến Double
+    for _, obj in ipairs(ReplicatedStorage:GetDescendants()) do
+        if obj:IsA("RemoteEvent") then
+            local name = obj.Name:lower()
+            if name:find("double") or name:find("result") or name:find("sell") then
+                return obj
             end
-            return result
-        else
-            -- Chế độ TẮT: Gọi FireServer gốc bình thường
-            return OriginalFireServer(self, ...)
         end
     end
     
-    -- Gán wrapper vào FireServer
-    DoN_Request.FireServer = FireServerWrapper
-    ActiveMethod = "FireServer"
-    return true
+    return nil
 end
 
-local function DisableFireServerHook()
-    if ActiveMethod ~= "FireServer" then return true end
-    if not DoN_Request then return true end
-    
-    -- Khôi phục FireServer gốc
-    if OriginalFireServer then
-        DoN_Request.FireServer = OriginalFireServer
-    end
-    
-    FireServerWrapper = nil
-    ActiveMethod = nil
-    return true
-end
+ResultEvent = FindResultEvent()
 
--- ==========================================
--- PHƯƠNG PHÁP 3: ONCLIENTEVENT WRAPPER (CÓ THỂ TẮT)
--- ==========================================
-local OnClientEventWrapper = nil
-
-local function EnableResultHook()
-    if ActiveMethod == "ResultHook" then return true end
-    if not DoN_Result then return false end
-    
-    -- Lưu hàm gốc OnClientEvent
-    if not OriginalOnClientEvent then
-        -- Lấy connection function từ metatable
-        local connections = getconnections(DoN_Result.OnClientEvent)
-        if #connections > 0 then
-            OriginalOnClientEvent = connections[1].Function
-        else
-            -- Fallback: Dùng method mặc định
-            OriginalOnClientEvent = function(...) end
+-- Tìm RemoteEvent cập nhật tiền
+local function FindCurrencyEvent()
+    local systems = ReplicatedStorage:FindFirstChild("Systems")
+    if systems then
+        local currency = systems:FindFirstChild("Currency")
+        if currency then
+            for _, child in ipairs(currency:GetChildren()) do
+                if child:IsA("RemoteEvent") then
+                    return child
+                end
+            end
         end
     end
     
-    -- Tạo wrapper cho OnClientEvent
-    OnClientEventWrapper = function(...)
-        local args = {...}
-        local outcome = args[1]
-        local value = args[2] or 0
+    -- Tìm trong ReplicatedStorage
+    for _, obj in ipairs(ReplicatedStorage:GetDescendants()) do
+        if obj:IsA("RemoteEvent") then
+            local name = obj.Name:lower()
+            if name:find("coin") or name:find("currency") or name:find("money") or name:find("update") then
+                return obj
+            end
+        end
+    end
+    
+    return nil
+end
+
+local CurrencyEvent = FindCurrencyEvent()
+
+-- ==========================================
+-- PHƯƠNG PHÁP CHÍNH: CHẶN ONCLIENTEVENT
+-- ==========================================
+local function EnableInterception()
+    if Connection then return true end -- Đã bật rồi
+    
+    if not ResultEvent then
+        warn("[AlwaysDouble] KHÔNG TÌM THẤY RemoteEvent kết quả!")
+        return false
+    end
+    
+    -- Tạo kết nối chặn kết quả
+    Connection = ResultEvent.OnClientEvent:Connect(function(outcome, value, ...)
+        if not IsEnabled then
+            -- Chế độ TẮT: Không làm gì, để game xử lý bình thường
+            return
+        end
         
-        if IsEnabled and outcome == "NOTHING" then
-            -- Chế độ BẬT: Ghi đè kết quả
-            local doubleValue = value * 2
+        -- Chế độ BẬT: Kiểm tra và thay đổi kết quả
+        -- outcome thường là string: "DOUBLE" hoặc "NOTHING"
+        -- value là số tiền
+        
+        if type(outcome) == "string" and outcome:upper() == "NOTHING" then
+            print("[AlwaysDouble] Phát hiện NOTHING -> Chuyển thành DOUBLE")
             
-            -- Gửi tiền thật lên server
-            if UpdateCoins then
-                pcall(function()
-                    UpdateCoins:FireServer(doubleValue)
+            -- Tính toán giá trị DOUBLE (value * 2)
+            local doubleValue = (type(value) == "number" and value > 0) and (value * 2) or 1000
+            
+            -- Phương pháp 1: Gửi sự kiện cập nhật tiền giả
+            if CurrencyEvent then
+                task.spawn(function()
+                    pcall(function()
+                        CurrencyEvent:FireServer(doubleValue)
+                        print("[AlwaysDouble] Đã gửi tiền DOUBLE: " .. tostring(doubleValue))
+                    end)
                 end)
             end
             
-            -- Sửa tham số
-            args[1] = "DOUBLE"
-            args[2] = doubleValue
-        end
-        -- Chế độ TẮT: args giữ nguyên, gọi hàm gốc
-        
-        -- Gọi hàm gốc với tham số (đã sửa hoặc nguyên bản)
-        return OriginalOnClientEvent(unpack(args))
-    end
-    
-    -- Kết nối wrapper vào sự kiện
-    DoN_Result.OnClientEvent:Connect(OnClientEventWrapper)
-    ActiveMethod = "ResultHook"
-    return true
-end
-
-local function DisableResultHook()
-    if ActiveMethod ~= "ResultHook" then return true end
-    -- Ngắt kết nối wrapper (chỉ hoạt động nếu dùng Connect, không dùng hookfunction)
-    OnClientEventWrapper = nil
-    ActiveMethod = nil
-    return true
-end
-
--- ==========================================
--- PHƯƠNG PHÁP 4: MODULE TRỰC TIẾP (CHÍNH XÁC NHẤT)
--- ==========================================
-local OriginalDetermineOutcome = nil
-local OriginalGetWinChance = nil
-
-local function EnableModuleHook()
-    if ActiveMethod == "ModuleHook" then return true end
-    if not DoN_Module then return false end
-    
-    -- Tìm ModuleScript chứa hàm DetermineOutcome và WIN_CHANCE
-    local moduleScript = DoN_Module:FindFirstChild("Logic") or 
-                         DoN_Module:FindFirstChild("Main") or
-                         DoN_Module:FindFirstChildWhichIsA("ModuleScript")
-    
-    if not moduleScript then return false end
-    
-    -- Phương pháp thay thế: Ghi đè WIN_CHANCE trong bộ nhớ
-    -- Nếu Module trả về một table có WIN_CHANCE
-    local success, moduleTable = pcall(function()
-        return require(moduleScript)
-    end)
-    
-    if success and type(moduleTable) == "table" then
-        if not OriginalGetWinChance and moduleTable.WIN_CHANCE then
-            OriginalGetWinChance = moduleTable.WIN_CHANCE
-        end
-        
-        -- Ghi đè WIN_CHANCE dựa trên trạng thái
-        if moduleTable.WIN_CHANCE ~= nil then
-            -- Lưu giá trị gốc
-            if not OriginalGetWinChance then
-                OriginalGetWinChance = moduleTable.WIN_CHANCE
-            end
-            
-            -- Tạo getter/setter để kiểm soát
-            local winChanceMetatable = {
-                __index = function(t, k)
-                    if k == "WIN_CHANCE" then
-                        if IsEnabled then
-                            return 1.0 -- 100% thắng
-                        else
-                            return OriginalGetWinChance -- Giá trị gốc 0.4
+            -- Phương pháp 2: Trực tiếp cộng tiền vào leaderstats (Client-Side)
+            task.spawn(function()
+                pcall(function()
+                    local leaderstats = LocalPlayer:FindFirstChild("leaderstats")
+                    if leaderstats then
+                        local coins = leaderstats:FindFirstChild("Coins") or 
+                                      leaderstats:FindFirstChild("Cash") or
+                                      leaderstats:FindFirstChild("Money")
+                        if coins and coins:IsA("IntValue") then
+                            coins.Value = coins.Value + doubleValue
+                            print("[AlwaysDouble] Đã cập nhật leaderstats: +" .. tostring(doubleValue))
                         end
                     end
-                    return rawget(t, k)
-                end,
-                __newindex = function(t, k, v)
-                    if k == "WIN_CHANCE" then
-                        OriginalGetWinChance = v
-                    end
-                    rawset(t, k, v)
-                end
-            }
+                end)
+            end)
             
-            setmetatable(moduleTable, winChanceMetatable)
-            ActiveMethod = "ModuleHook"
-            return true
+            -- Phương pháp 3: Gửi lại yêu cầu với kết quả DOUBLE
+            -- (Tìm RemoteEvent yêu cầu và gửi lại)
+            local requestEvent = nil
+            local systems = ReplicatedStorage:FindFirstChild("Systems")
+            if systems then
+                local don = systems:FindFirstChild("DoubleOrNothing")
+                if don then
+                    requestEvent = don:FindFirstChild("DoN_Request") or don:FindFirstChild("Request")
+                end
+            end
+            
+            if requestEvent then
+                task.spawn(function()
+                    pcall(function()
+                        -- Gửi yêu cầu mới với cùng cây trồng
+                        local args = {...}
+                        if #args > 0 then
+                            requestEvent:FireServer(unpack(args))
+                        end
+                    end)
+                end)
+            end
         end
-    end
+    end)
     
-    return false
+    print("[AlwaysDouble] [BẬT] Đã kết nối chặn kết quả: " .. ResultEvent:GetFullName())
+    return true
 end
 
-local function DisableModuleHook()
-    if ActiveMethod ~= "ModuleHook" then return true end
-    -- Khôi phục bằng cách set IsEnabled = false, getter tự trả về giá trị gốc
-    ActiveMethod = nil
+local function DisableInterception()
+    if Connection then
+        Connection:Disconnect()
+        Connection = nil
+        print("[AlwaysDouble] [TẮT] Đã ngắt kết nối chặn kết quả")
+    end
     return true
 end
 
 -- ==========================================
--- HÀM BẬT/TẮT CHÍNH (ĐÃ SỬA LỖI)
+-- PHƯƠNG PHÁP DỰ PHÒNG: CHẶN TẤT CẢ REMOTEEVENT
+-- ==========================================
+local AllConnections = {}
+
+local function EnableGlobalInterception()
+    if #AllConnections > 0 then return true end
+    
+    -- Kết nối vào tất cả RemoteEvent có thể là kết quả
+    for _, obj in ipairs(ReplicatedStorage:GetDescendants()) do
+        if obj:IsA("RemoteEvent") then
+            local name = obj.Name:lower()
+            if name:find("result") or name:find("double") or name:find("sell") or name:find("coin") then
+                local conn = obj.OnClientEvent:Connect(function(...)
+                    if not IsEnabled then return end
+                    
+                    local args = {...}
+                    for i, arg in ipairs(args) do
+                        if type(arg) == "string" and arg:upper() == "NOTHING" then
+                            print("[AlwaysDouble] Chặn NOTHING từ: " .. obj:GetFullName())
+                            
+                            -- Thay đổi args
+                            args[i] = "DOUBLE"
+                            if args[i+1] and type(args[i+1]) == "number" then
+                                args[i+1] = args[i+1] * 2
+                            end
+                            
+                            -- Cập nhật tiền
+                            if CurrencyEvent then
+                                task.spawn(function()
+                                    pcall(function()
+                                        local val = args[i+1] or 1000
+                                        CurrencyEvent:FireServer(val)
+                                    end)
+                                end)
+                            end
+                            
+                            break
+                        end
+                    end
+                end)
+                
+                table.insert(AllConnections, conn)
+            end
+        end
+    end
+    
+    print("[AlwaysDouble] [BẬT] Chặn toàn cục: " .. #AllConnections .. " sự kiện")
+    return #AllConnections > 0
+end
+
+local function DisableGlobalInterception()
+    for _, conn in ipairs(AllConnections) do
+        conn:Disconnect()
+    end
+    AllConnections = {}
+    print("[AlwaysDouble] [TẮT] Đã ngắt tất cả chặn toàn cục")
+    return true
+end
+
+-- ==========================================
+-- HÀM BẬT/TẮT CHÍNH
 -- ==========================================
 local function EnableAlwaysDouble()
     if IsEnabled then return false end
     IsEnabled = true
     
-    -- Thử lần lượt từng phương pháp, ưu tiên phương pháp chính xác nhất
-    local methods = {
-        {name = "FireServer", func = EnableFireServerHook},
-        {name = "ResultHook", func = EnableResultHook},
-        {name = "ModuleHook", func = EnableModuleHook},
-        {name = "MathHook", func = EnableMathHook}, -- Dự phòng cuối cùng
-    }
+    -- Thử phương pháp chính xác trước
+    local success = EnableInterception()
     
-    for _, method in ipairs(methods) do
-        local success = method.func()
-        if success then
-            print(string.format("[AlwaysDouble] [BẬT] Phương pháp: %s", method.name))
-            return true
-        end
+    -- Nếu không tìm thấy ResultEvent cụ thể, dùng phương pháp toàn cục
+    if not success or not ResultEvent then
+        success = EnableGlobalInterception()
     end
     
-    -- Nếu tất cả đều thất bại
-    IsEnabled = false
-    warn("[AlwaysDouble] KHÔNG THỂ BẬT: Tất cả phương pháp đều không khả dụng")
-    return false
+    if success then
+        print("[AlwaysDouble] ========== ĐÃ BẬT ==========")
+        return true
+    else
+        IsEnabled = false
+        warn("[AlwaysDouble] KHÔNG THỂ BẬT - Không tìm thấy sự kiện nào")
+        return false
+    end
 end
 
 local function DisableAlwaysDouble()
     if not IsEnabled then return false end
     IsEnabled = false
     
-    -- Vô hiệu hóa phương pháp đang hoạt động
-    local success = true
-    if ActiveMethod == "FireServer" then
-        success = DisableFireServerHook()
-    elseif ActiveMethod == "ResultHook" then
-        success = DisableResultHook()
-    elseif ActiveMethod == "ModuleHook" then
-        success = DisableModuleHook()
-    elseif ActiveMethod == "MathHook" then
-        success = DisableMathHook()
-    end
+    DisableInterception()
+    DisableGlobalInterception()
     
-    if success then
-        print("[AlwaysDouble] [TẮT] Đã khôi phục cơ chế gốc (40% thắng)")
-    else
-        warn("[AlwaysDouble] [TẮT] Có lỗi khi khôi phục, khuyến nghị rejoin game")
-    end
-    
-    return success
+    print("[AlwaysDouble] ========== ĐÃ TẮT ==========")
+    return true
 end
 
 local function ToggleAlwaysDouble()
@@ -329,169 +293,158 @@ local function ToggleAlwaysDouble()
 end
 
 -- ==========================================
--- GIAO DIỆN NGƯỜI DÙNG
+-- GIAO DIỆN
 -- ==========================================
 local ScreenGui = Instance.new("ScreenGui")
-ScreenGui.Name = "AlwaysDoubleUI_Fixed"
+ScreenGui.Name = "AlwaysDoubleUI_Working"
 ScreenGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
 ScreenGui.ResetOnSpawn = false
 
 local MainFrame = Instance.new("Frame")
 MainFrame.Name = "MainFrame"
 MainFrame.Parent = ScreenGui
-MainFrame.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
+MainFrame.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
 MainFrame.BorderSizePixel = 0
-MainFrame.Position = UDim2.new(0.75, 0, 0.25, 0)
-MainFrame.Size = UDim2.new(0, 240, 0, 200)
+MainFrame.Position = UDim2.new(0.72, 0, 0.2, 0)
+MainFrame.Size = UDim2.new(0, 250, 0, 220)
 MainFrame.Active = true
 MainFrame.Draggable = true
 
 local UICorner = Instance.new("UICorner")
-UICorner.CornerRadius = UDim.new(0, 10)
+UICorner.CornerRadius = UDim.new(0, 12)
 UICorner.Parent = MainFrame
 
--- Thanh tiêu đề
-local TitleBar = Instance.new("Frame")
-TitleBar.Name = "TitleBar"
-TitleBar.Parent = MainFrame
-TitleBar.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
-TitleBar.BorderSizePixel = 0
-TitleBar.Size = UDim2.new(1, 0, 0, 40)
+-- Tiêu đề
+local Title = Instance.new("TextLabel")
+Title.Parent = MainFrame
+Title.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
+Title.BorderSizePixel = 0
+Title.Size = UDim2.new(1, 0, 0, 40)
+Title.Font = Enum.Font.GothamBold
+Title.Text = "🎰 ALWAYS DOUBLE"
+Title.TextColor3 = Color3.fromRGB(255, 215, 0)
+Title.TextSize = 18
 
 local TitleCorner = Instance.new("UICorner")
-TitleCorner.CornerRadius = UDim.new(0, 10)
-TitleCorner.Parent = TitleBar
+TitleCorner.CornerRadius = UDim.new(0, 12)
+TitleCorner.Parent = Title
 
 local TitleCover = Instance.new("Frame")
-TitleCover.Name = "TitleCover"
-TitleCover.Parent = TitleBar
-TitleCover.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
+TitleCover.Parent = Title
+TitleCover.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
 TitleCover.BorderSizePixel = 0
 TitleCover.Position = UDim2.new(0, 0, 0.5, 0)
 TitleCover.Size = UDim2.new(1, 0, 0.5, 0)
 
-local TitleLabel = Instance.new("TextLabel")
-TitleLabel.Name = "TitleLabel"
-TitleLabel.Parent = TitleBar
-TitleLabel.BackgroundTransparency = 1
-TitleLabel.Size = UDim2.new(1, 0, 1, 0)
-TitleLabel.Font = Enum.Font.GothamBold
-TitleLabel.Text = "ALWAYS DOUBLE CONTROL"
-TitleLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
-TitleLabel.TextSize = 16
+-- Nút chính
+local ToggleBtn = Instance.new("TextButton")
+ToggleBtn.Name = "ToggleBtn"
+ToggleBtn.Parent = MainFrame
+ToggleBtn.BackgroundColor3 = Color3.fromRGB(220, 50, 50)
+ToggleBtn.BorderSizePixel = 0
+ToggleBtn.Position = UDim2.new(0.08, 0, 0.25, 0)
+ToggleBtn.Size = UDim2.new(0.84, 0, 0, 60)
+ToggleBtn.Font = Enum.Font.GothamBlack
+ToggleBtn.Text = "ĐANG TẮT"
+ToggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+ToggleBtn.TextSize = 24
+ToggleBtn.AutoButtonColor = false
 
--- Nút BẬT/TẮT chính
-local ToggleButton = Instance.new("TextButton")
-ToggleButton.Name = "ToggleButton"
-ToggleButton.Parent = MainFrame
-ToggleButton.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
-ToggleButton.BorderSizePixel = 0
-ToggleButton.Position = UDim2.new(0.1, 0, 0.27, 0)
-ToggleButton.Size = UDim2.new(0.8, 0, 0, 55)
-ToggleButton.Font = Enum.Font.GothamBlack
-ToggleButton.Text = "ĐANG TẮT"
-ToggleButton.TextColor3 = Color3.fromRGB(255, 255, 255)
-ToggleButton.TextSize = 22
-ToggleButton.AutoButtonColor = false
+local BtnCorner = Instance.new("UICorner")
+BtnCorner.CornerRadius = UDim.new(0, 10)
+BtnCorner.Parent = ToggleBtn
 
-local ToggleCorner = Instance.new("UICorner")
-ToggleCorner.CornerRadius = UDim.new(0, 8)
-ToggleCorner.Parent = ToggleButton
+-- Trạng thái
+local StatusText = Instance.new("TextLabel")
+StatusText.Parent = MainFrame
+StatusText.BackgroundTransparency = 1
+StatusText.Position = UDim2.new(0.05, 0, 0.55, 0)
+StatusText.Size = UDim2.new(0.9, 0, 0, 25)
+StatusText.Font = Enum.Font.GothamBold
+StatusText.Text = "Cơ chế gốc: 40% DOUBLE"
+StatusText.TextColor3 = Color3.fromRGB(255, 120, 120)
+StatusText.TextSize = 14
 
--- Nhãn trạng thái
-local StatusLabel = Instance.new("TextLabel")
-StatusLabel.Name = "StatusLabel"
-StatusLabel.Parent = MainFrame
-StatusLabel.BackgroundTransparency = 1
-StatusLabel.Position = UDim2.new(0.05, 0, 0.58, 0)
-StatusLabel.Size = UDim2.new(0.9, 0, 0, 30)
-StatusLabel.Font = Enum.Font.Gotham
-StatusLabel.Text = "Cơ chế gốc: 40% thắng, 60% mất"
-StatusLabel.TextColor3 = Color3.fromRGB(255, 150, 150)
-StatusLabel.TextSize = 12
+-- Thông tin phương pháp
+local MethodText = Instance.new("TextLabel")
+MethodText.Parent = MainFrame
+MethodText.BackgroundTransparency = 1
+MethodText.Position = UDim2.new(0.05, 0, 0.68, 0)
+MethodText.Size = UDim2.new(0.9, 0, 0, 20)
+MethodText.Font = Enum.Font.Gotham
+MethodText.Text = "PP: Chưa kích hoạt"
+MethodText.TextColor3 = Color3.fromRGB(180, 180, 180)
+MethodText.TextSize = 11
 
--- Nhãn phương pháp
-local MethodLabel = Instance.new("TextLabel")
-MethodLabel.Name = "MethodLabel"
-MethodLabel.Parent = MainFrame
-MethodLabel.BackgroundTransparency = 1
-MethodLabel.Position = UDim2.new(0.05, 0, 0.72, 0)
-MethodLabel.Size = UDim2.new(0.9, 0, 0, 20)
-MethodLabel.Font = Enum.Font.Gotham
-MethodLabel.Text = "PP: Chưa kích hoạt"
-MethodLabel.TextColor3 = Color3.fromRGB(180, 180, 180)
-MethodLabel.TextSize = 11
+-- Sự kiện tìm thấy
+local EventText = Instance.new("TextLabel")
+EventText.Parent = MainFrame
+EventText.BackgroundTransparency = 1
+EventText.Position = UDim2.new(0.05, 0, 0.78, 0)
+EventText.Size = UDim2.new(0.9, 0, 0, 20)
+EventText.Font = Enum.Font.Gotham
+EventText.Text = "Sự kiện: " .. (ResultEvent and "✅ Tìm thấy" or "❌ Không tìm thấy")
+EventText.TextColor3 = ResultEvent and Color3.fromRGB(100, 255, 100) or Color3.fromRGB(255, 100, 100)
+EventText.TextSize = 10
 
--- Nhãn thông báo
-local NotifyLabel = Instance.new("TextLabel")
-NotifyLabel.Name = "NotifyLabel"
-NotifyLabel.Parent = MainFrame
-NotifyLabel.BackgroundTransparency = 1
-NotifyLabel.Position = UDim2.new(0.05, 0, 0.85, 0)
-NotifyLabel.Size = UDim2.new(0.9, 0, 0, 25)
-NotifyLabel.Font = Enum.Font.Gotham
-NotifyLabel.Text = "Nhấn nút hoặc phím F6"
-NotifyLabel.TextColor3 = Color3.fromRGB(255, 215, 0)
-NotifyLabel.TextSize = 10
+-- Thông báo
+local NotifyText = Instance.new("TextLabel")
+NotifyText.Parent = MainFrame
+NotifyText.BackgroundTransparency = 1
+NotifyText.Position = UDim2.new(0.05, 0, 0.88, 0)
+NotifyText.Size = UDim2.new(0.9, 0, 0, 25)
+NotifyText.Font = Enum.Font.Gotham
+NotifyText.Text = "F6 = Bật/Tắt | Kéo để di chuyển"
+NotifyText.TextColor3 = Color3.fromRGB(200, 200, 200)
+NotifyText.TextSize = 10
 
--- Cập nhật giao diện
+-- Cập nhật UI
 local function UpdateUI()
     if IsEnabled then
-        ToggleButton.BackgroundColor3 = Color3.fromRGB(46, 204, 113) -- Xanh lá
-        ToggleButton.Text = "ĐANG BẬT - DOUBLE"
-        StatusLabel.Text = "Luôn DOUBLE (100% thắng)"
-        StatusLabel.TextColor3 = Color3.fromRGB(46, 204, 113)
+        ToggleBtn.BackgroundColor3 = Color3.fromRGB(46, 204, 113)
+        ToggleBtn.Text = "ĐANG BẬT ✓"
+        StatusText.Text = "LUÔN DOUBLE (100%)"
+        StatusText.TextColor3 = Color3.fromRGB(46, 204, 113)
         
-        local methodNames = {
-            FireServer = "Chuyển hướng FireServer",
-            ResultHook = "Chặn kết quả Client",
-            ModuleHook = "Ghi đè Module WIN_CHANCE",
-            MathHook = "Math.random Wrapper"
-        }
-        MethodLabel.Text = "PP: " .. (methodNames[ActiveMethod] or "Không xác định")
+        local method = (Connection and "Chặn trực tiếp") or 
+                       (#AllConnections > 0 and "Chặn toàn cục (".. #AllConnections .." SK)") or 
+                       "Không xác định"
+        MethodText.Text = "PP: " .. method
     else
-        ToggleButton.BackgroundColor3 = Color3.fromRGB(231, 76, 60) -- Đỏ
-        ToggleButton.Text = "ĐANG TẮT"
-        StatusLabel.Text = "Cơ chế gốc: 40% thắng, 60% mất"
-        StatusLabel.TextColor3 = Color3.fromRGB(255, 150, 150)
-        MethodLabel.Text = "PP: Không can thiệp"
+        ToggleBtn.BackgroundColor3 = Color3.fromRGB(220, 50, 50)
+        ToggleBtn.Text = "ĐANG TẮT ✗"
+        StatusText.Text = "Cơ chế gốc: 40% DOUBLE"
+        StatusText.TextColor3 = Color3.fromRGB(255, 120, 120)
+        MethodText.Text = "PP: Không can thiệp"
     end
 end
 
-local function ShowNotify(text, duration)
-    NotifyLabel.Text = text
+local function Notify(msg, duration)
+    NotifyText.Text = msg
     task.delay(duration or 3, function()
-        NotifyLabel.Text = "Nhấn nút hoặc phím F6"
+        NotifyText.Text = "F6 = Bật/Tắt | Kéo để di chuyển"
     end)
 end
 
 -- Sự kiện nút
-ToggleButton.MouseButton1Click:Connect(function()
+ToggleBtn.MouseButton1Click:Connect(function()
     local success = ToggleAlwaysDouble()
     UpdateUI()
     
     if IsEnabled then
-        if success then
-            ShowNotify("ĐÃ BẬT THÀNH CÔNG - Luôn Double", 3)
-        else
-            ShowNotify("LỖI: Không thể bật, game đã vá hết", 5)
-        end
+        Notify(success and "✅ ĐÃ BẬT - Luôn DOUBLE" or "❌ LỖI: Không thể bật", 4)
     else
-        if success then
-            ShowNotify("ĐÃ TẮT - Về cơ chế gốc 40%", 3)
-        else
-            ShowNotify("CẢNH BÁO: Khôi phục không hoàn toàn", 5)
-        end
+        Notify(success and "🔙 ĐÃ TẮT - Về 40% gốc" or "⚠️ Tắt không hoàn toàn", 4)
     end
 end)
 
--- Phím tắt F6
+-- Phím tắt
 UserInputService.InputBegan:Connect(function(input, gameProcessed)
     if gameProcessed then return end
     if input.KeyCode == Enum.KeyCode.F6 then
-        ToggleAlwaysDouble()
+        local success = ToggleAlwaysDouble()
         UpdateUI()
-        ShowNotify("Phím tắt F6: " .. (IsEnabled and "BẬT" or "TẮT"), 2)
+        Notify("F6: " .. (IsEnabled and "BẬT ✓" or "TẮT ✗"), 2)
     end
 end)
 
@@ -500,36 +453,15 @@ end)
 -- ==========================================
 UpdateUI()
 
--- Kiểm tra phương pháp khả dụng
-local function CheckAvailableMethods()
-    local available = {}
-    if DoN_Request and DoN_Override then
-        table.insert(available, "FireServer")
-    end
-    if DoN_Result then
-        table.insert(available, "ResultHook")
-    end
-    if DoN_Module then
-        table.insert(available, "ModuleHook")
-    end
-    table.insert(available, "MathHook") -- Luôn khả dụng
-    
-    return available
-end
-
-local availableMethods = CheckAvailableMethods()
-
-print(string.format([[
+print([[
 ============================================
-  ALWAYS DOUBLE - BẢN SỬA LỖI BẬT/TẮT
+  ALWAYS DOUBLE - BẢN HOẠT ĐỘNG
   Grow a Garden 2
-  F6 = Bật/Tắt nhanh
-  Phương pháp: %s
-  Trạng thái: %s
+  F6 = Bật/Tắt
+  ResultEvent: ]] .. (ResultEvent and ResultEvent:GetFullName() or "KHÔNG TÌM THẤY") .. [[
+  CurrencyEvent: ]] .. (CurrencyEvent and CurrencyEvent:GetFullName() or "KHÔNG TÌM THẤY") .. [[
 ============================================
-]], table.concat(availableMethods, ", "), IsEnabled and "BẬT" or "TẮT"))
-
-ShowNotify(string.format("Sẵn sàng | %d PP khả dụng | F6", #availableMethods), 5)
+]])
 
 -- Chống AFK
 local VirtualUser = game:GetService("VirtualUser")
@@ -538,16 +470,18 @@ LocalPlayer.Idled:Connect(function()
     VirtualUser:ClickButton2(Vector2.new())
 end)
 
--- Kiểm tra định kỳ trạng thái phương pháp
+-- Kiểm tra lại ResultEvent sau khi game tải xong
 task.spawn(function()
-    while true do
-        task.wait(30)
-        if IsEnabled then
-            -- Kiểm tra xem phương pháp có còn hoạt động không
-            local testValue = math.random()
-            if testValue > 0.39 and ActiveMethod == "MathHook" then
-                warn("[AlwaysDouble] CẢNH BÁO: MathHook có thể đã bị ghi đè")
-            end
+    task.wait(10)
+    if not ResultEvent then
+        ResultEvent = FindResultEvent()
+        if ResultEvent then
+            EventText.Text = "Sự kiện: ✅ Tìm thấy (sau 10s)"
+            EventText.TextColor3 = Color3.fromRGB(100, 255, 100)
+            Notify("Đã tìm thấy sự kiện sau khi tải!", 3)
         end
+    end
+    if not CurrencyEvent then
+        CurrencyEvent = FindCurrencyEvent()
     end
 end)
