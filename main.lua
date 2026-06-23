@@ -1,494 +1,400 @@
 -- ==========================================
--- SCRIPT: Grow a Garden 2 - Always Double
--- VERSION: 4.0 Final
--- METHOD: Metatable Hook + Signal Interception
--- GUI: ON (Xanh) / OFF (Đỏ)
+-- SCRIPT: Always Double - Mobile Toggle UI
+-- VERSION: 5.0 Mobile Edition
+-- GUI: Công tắc trượt (Switch Toggle) kiểu điện thoại
 -- ==========================================
 
 -- // Services
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
-local HttpService = game:GetService("HttpService")
+local TweenService = game:GetService("TweenService")
 local LocalPlayer = Players.LocalPlayer
 local VirtualUser = game:GetService("VirtualUser")
 
 -- // State
 local IsEnabled = false
 local HookedSignals = {}
+local LeaderstatsMonitor = nil
+local MoneyValue = nil
+local LastMoneyValue = 0
 local OriginalMathRandom = math.random
-local OriginalMathRandomSeed = math.randomseed
 
 -- ==========================================
--- PHASE 1: TÌM TẤT CẢ REMOTE EVENT/FUNCTION
+-- CORE: TÌM REMOTE EVENT
 -- ==========================================
-local function DeepFindAllRemotes()
-    local found = {Events = {}, Functions = {}}
-    
-    local containers = {
-        ReplicatedStorage,
-        game:GetService("Workspace"),
-        LocalPlayer.PlayerScripts,
-        LocalPlayer.PlayerGui
-    }
-    
-    for _, container in ipairs(containers) do
-        pcall(function()
-            for _, obj in ipairs(container:GetDescendants()) do
-                if obj:IsA("RemoteEvent") then
-                    table.insert(found.Events, obj)
-                elseif obj:IsA("RemoteFunction") then
-                    table.insert(found.Functions, obj)
-                end
+local function GetAllRemotes()
+    local events = {}
+    pcall(function()
+        for _, obj in ipairs(ReplicatedStorage:GetDescendants()) do
+            if obj:IsA("RemoteEvent") then
+                table.insert(events, obj)
             end
-        end)
-    end
-    
-    return found
+        end
+    end)
+    return events
 end
 
 -- ==========================================
--- PHASE 2: HOOK TẤT CẢ ONCLIENTEVENT
+-- CORE: HOOK ONCLIENTEVENT
 -- ==========================================
-local function HookAllClientEvents(remotes)
+local function HookEvents(remotes)
     local count = 0
-    
-    for _, remote in ipairs(remotes.Events) do
+    for _, remote in ipairs(remotes) do
         pcall(function()
-            local signal = remote.OnClientEvent
-            
-            -- Tạo wrapper cho signal
-            local originalFire = signal.Fire
-            local connectionList = {}
-            
-            -- Ghi đè phương thức Connect của signal
-            local mt = getrawmetatable(signal) or {}
-            local oldConnect = mt.__call or signal.Connect
-            
-            local function newConnect(callback)
-                local wrappedCallback = function(...)
-                    if not IsEnabled then
-                        -- OFF: Chạy callback gốc
-                        return callback(...)
-                    end
-                    
-                    -- ON: Kiểm tra và sửa đối số
-                    local args = {...}
-                    local modified = false
-                    
-                    for i = 1, #args do
-                        local arg = args[i]
-                        
-                        -- Phát hiện string "NOTHING", "LOSE", "FAIL"
-                        if type(arg) == "string" then
-                            local upper = arg:upper()
-                            if upper == "NOTHING" or upper == "LOSE" or upper == "FAIL" then
-                                args[i] = "DOUBLE"
-                                modified = true
-                            end
+            local conn = remote.OnClientEvent:Connect(function(...)
+                if not IsEnabled then return end
+                local args = {...}
+                local changed = false
+                
+                for i, arg in ipairs(args) do
+                    if type(arg) == "string" then
+                        local u = arg:upper()
+                        if u == "NOTHING" or u == "LOSE" or u == "FAIL" then
+                            args[i] = "DOUBLE"
+                            changed = true
                         end
-                        
-                        -- Phát hiện boolean false (thất bại)
-                        if type(arg) == "boolean" and arg == false then
-                            args[i] = true
-                            modified = true
-                        end
-                        
-                        -- Phát hiện số 0 (mất hết)
-                        if type(arg) == "number" and arg == 0 and i >= 2 then
-                            local prevArg = args[i-1]
-                            if type(prevArg) == "number" and prevArg > 0 then
-                                args[i] = prevArg * 2
-                                modified = true
-                            else
-                                args[i] = 1000
-                                modified = true
-                            end
+                    elseif type(arg) == "boolean" and arg == false then
+                        args[i] = true
+                        changed = true
+                    elseif type(arg) == "number" and arg == 0 and i >= 2 then
+                        if type(args[i-1]) == "number" and args[i-1] > 0 then
+                            args[i] = args[i-1] * 2
+                            changed = true
                         end
                     end
-                    
-                    if modified then
-                        print("[Hook] Modified args for: " .. remote.Name)
-                    end
-                    
-                    return callback(unpack(args))
                 end
                 
-                local conn = oldConnect(signal, wrappedCallback)
-                table.insert(connectionList, conn)
-                return conn
-            end
-            
-            signal.Connect = newConnect
-            table.insert(HookedSignals, {Signal = signal, Connections = connectionList, OriginalConnect = oldConnect})
+                if changed then
+                    print("[Signal] Fixed: " .. remote.Name)
+                end
+            end)
+            table.insert(HookedSignals, conn)
             count = count + 1
         end)
     end
-    
     return count
 end
 
 -- ==========================================
--- PHASE 3: HOOK MATH.RANDOM (SERVER-SIDE FALLBACK)
+-- CORE: HOOK MATH.RANDOM
 -- ==========================================
-local function HookMathRandom()
+local function EnableMathHook()
     math.random = function(...)
-        if not IsEnabled then
-            return OriginalMathRandom(...)
-        end
-        
-        local args = {...}
-        local count = select("#", ...)
-        
-        if count == 0 then
-            -- Trả về số < 0.4 (WIN_CHANCE)
-            return OriginalMathRandom() * 0.39
-        elseif count == 1 then
-            local max = args[1]
-            if type(max) == "number" and max > 1 then
-                -- Trả về giá trị gần max nhất
-                return max - OriginalMathRandom() * 0.01
-            end
-            return max
-        elseif count == 2 then
-            -- Trả về max
-            return args[2]
-        end
-        
+        if not IsEnabled then return OriginalMathRandom(...) end
+        local n = select("#", ...)
+        if n == 0 then return OriginalMathRandom() * 0.39
+        elseif n == 1 then return ...
+        elseif n == 2 then return select(2, ...) end
         return OriginalMathRandom(...)
     end
-    
-    math.randomseed = function(seed)
-        -- Giữ seed gốc nhưng vô hiệu hóa ảnh hưởng
-        OriginalMathRandomSeed(seed)
-        if IsEnabled then
-            -- Đặt seed để kết quả luôn có lợi
-            OriginalMathRandomSeed(42)
-        end
-    end
+end
+
+local function DisableMathHook()
+    math.random = OriginalMathRandom
 end
 
 -- ==========================================
--- PHASE 4: THEO DÕI LEADERSTATS
+-- CORE: LEADERSTATS MONITOR
 -- ==========================================
-local LeaderstatsMonitor = nil
-local LastMoneyValue = 0
-local MoneyValue = nil
-
-local function StartLeaderstatsMonitor()
-    local leaderstats = LocalPlayer:FindFirstChild("leaderstats")
-    if not leaderstats then
-        leaderstats = LocalPlayer:WaitForChild("leaderstats", 5)
-    end
+local function StartMoneyMonitor()
+    local ls = LocalPlayer:FindFirstChild("leaderstats")
+    if not ls then ls = LocalPlayer:WaitForChild("leaderstats", 5) end
+    if not ls then return end
     
-    if not leaderstats then return end
-    
-    -- Tìm giá trị tiền
-    for _, child in ipairs(leaderstats:GetChildren()) do
-        if child:IsA("IntValue") or child:IsA("DoubleValue") or child:IsA("NumberValue") then
-            local name = child.Name:lower()
-            if name:find("coin") or name:find("cash") or name:find("money") or 
-               name:find("gem") or name:find("gold") or name:find("point") then
-                MoneyValue = child
-                LastMoneyValue = child.Value
+    for _, c in ipairs(ls:GetChildren()) do
+        if c:IsA("IntValue") then
+            local n = c.Name:lower()
+            if n:find("coin") or n:find("cash") or n:find("money") or n:find("gem") then
+                MoneyValue = c
+                LastMoneyValue = c.Value
                 break
             end
         end
     end
-    
     if not MoneyValue then
-        -- Lấy IntValue đầu tiên
-        for _, child in ipairs(leaderstats:GetChildren()) do
-            if child:IsA("IntValue") then
-                MoneyValue = child
-                LastMoneyValue = child.Value
-                break
-            end
+        for _, c in ipairs(ls:GetChildren()) do
+            if c:IsA("IntValue") then MoneyValue = c; LastMoneyValue = c.Value; break end
         end
     end
-    
     if not MoneyValue then return end
     
-    -- Theo dõi thay đổi
-    LeaderstatsMonitor = MoneyValue.Changed:Connect(function(newValue)
-        if not IsEnabled then
-            LastMoneyValue = newValue
-            return
-        end
-        
-        local diff = newValue - LastMoneyValue
-        
-        -- Nếu tiền GIẢM (do NOTHING)
+    LeaderstatsMonitor = MoneyValue.Changed:Connect(function(v)
+        if not IsEnabled then LastMoneyValue = v; return end
+        local diff = v - LastMoneyValue
         if diff < 0 then
-            local lost = math.abs(diff)
-            local double = lost * 2
-            
-            print(string.format("[Money] Phát hiện mất %d -> Hoàn trả %d", lost, double))
-            
-            -- Ngắt kết nối tạm thời
+            local add = math.abs(diff) * 2
             LeaderstatsMonitor:Disconnect()
-            
-            -- Hoàn tiền gấp đôi
-            MoneyValue.Value = MoneyValue.Value + double
-            
-            -- Kết nối lại
+            MoneyValue.Value = MoneyValue.Value + add
             LastMoneyValue = MoneyValue.Value
-            LeaderstatsMonitor = MoneyValue.Changed:Connect(function(v)
-                if not IsEnabled then
-                    LastMoneyValue = v
-                    return
-                end
-                LastMoneyValue = v
+            LeaderstatsMonitor = MoneyValue.Changed:Connect(function(v2)
+                if not IsEnabled then LastMoneyValue = v2; return end
+                LastMoneyValue = v2
             end)
         else
-            LastMoneyValue = newValue
+            LastMoneyValue = v
         end
     end)
-    
-    print("[Money] Đang theo dõi: " .. MoneyValue.Name)
 end
 
 -- ==========================================
--- BẬT/TẮT
+-- BẬT / TẮT
 -- ==========================================
 local function Enable()
-    if IsEnabled then return false end
+    if IsEnabled then return end
     IsEnabled = true
-    
-    HookMathRandom()
-    
-    local remotes = DeepFindAllRemotes()
-    local hookedCount = HookAllClientEvents(remotes)
-    
-    if LeaderstatsMonitor == nil then
-        StartLeaderstatsMonitor()
-    end
-    
-    print(string.format("[AlwaysDouble] ===== BẬT ====="))
-    print(string.format("[AlwaysDouble] RemoteEvent: %d, RemoteFunction: %d", #remotes.Events, #remotes.Functions))
-    print(string.format("[AlwaysDouble] Đã hook: %d signals", hookedCount))
-    print(string.format("[AlwaysDouble] Leaderstats: %s", MoneyValue and MoneyValue.Name or "Không tìm thấy"))
-    
-    return true
+    EnableMathHook()
+    local remotes = GetAllRemotes()
+    HookEvents(remotes)
+    if not LeaderstatsMonitor then StartMoneyMonitor() end
+    print("[ON] Always Double Activated")
 end
 
 local function Disable()
-    if not IsEnabled then return false end
+    if not IsEnabled then return end
     IsEnabled = false
-    
-    -- Khôi phục math.random
-    math.random = OriginalMathRandom
-    math.randomseed = OriginalMathRandomSeed
-    
-    -- Khôi phục signal connections
-    for _, data in ipairs(HookedSignals) do
-        pcall(function()
-            data.Signal.Connect = data.OriginalConnect
-        end)
-    end
+    DisableMathHook()
+    for _, c in ipairs(HookedSignals) do pcall(function() c:Disconnect() end) end
     HookedSignals = {}
-    
-    -- Ngắt leaderstats monitor
-    if LeaderstatsMonitor then
-        LeaderstatsMonitor:Disconnect()
-        LeaderstatsMonitor = nil
-    end
-    
-    print("[AlwaysDouble] ===== TẮT - Đã khôi phục =====")
-    return true
+    if LeaderstatsMonitor then LeaderstatsMonitor:Disconnect(); LeaderstatsMonitor = nil end
+    print("[OFF] Restored Original")
 end
 
 local function Toggle()
-    if IsEnabled then
-        Disable()
-    else
-        Enable()
-    end
-    return IsEnabled
+    if IsEnabled then Disable() else Enable() end
 end
 
 -- ==========================================
--- GIAO DIỆN: ON (XANH) / OFF (ĐỎ)
+-- GIAO DIỆN SWITCH KIỂU ĐIỆN THOẠI
 -- ==========================================
-local function CreateGUI()
-    local ScreenGui = Instance.new("ScreenGui")
-    ScreenGui.Name = "AlwaysDoubleGUI"
-    ScreenGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
-    ScreenGui.ResetOnSpawn = false
-    ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+local function CreateMobileSwitchUI()
+    local SG = Instance.new("ScreenGui")
+    SG.Name = "MobileSwitch"
+    SG.Parent = LocalPlayer:WaitForChild("PlayerGui")
+    SG.ResetOnSpawn = false
+    SG.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    SG.IgnoreGuiInset = true
     
-    -- Container chính
-    local MainFrame = Instance.new("Frame")
-    MainFrame.Name = "MainFrame"
-    MainFrame.Parent = ScreenGui
-    MainFrame.BackgroundColor3 = Color3.fromRGB(18, 18, 18)
-    MainFrame.BorderSizePixel = 0
-    MainFrame.Position = UDim2.new(0.73, 0, 0.18, 0)
-    MainFrame.Size = UDim2.new(0, 240, 0, 200)
-    MainFrame.Active = true
-    MainFrame.Draggable = true
+    -- Kích thước dựa trên màn hình điện thoại
+    local ViewSize = workspace.CurrentCamera.ViewportSize
     
-    -- Bo góc
-    local MainCorner = Instance.new("UICorner")
-    MainCorner.CornerRadius = UDim.new(0, 12)
-    MainCorner.Parent = MainFrame
+    -- Panel container
+    local Panel = Instance.new("Frame")
+    Panel.Name = "Panel"
+    Panel.Parent = SG
+    Panel.BackgroundColor3 = Color3.fromRGB(22, 22, 25)
+    Panel.BorderSizePixel = 0
+    Panel.Size = UDim2.new(0, 280, 0, 140)
+    Panel.Position = UDim2.new(0.5, -140, 0.08, 0)
+    Panel.Active = true
+    Panel.Draggable = true
     
-    -- Viền sáng
-    local Stroke = Instance.new("UIStroke")
-    Stroke.Parent = MainFrame
-    Stroke.Thickness = 1.5
-    Stroke.Color = Color3.fromRGB(60, 60, 60)
-    Stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    local PanelCorner = Instance.new("UICorner")
+    PanelCorner.CornerRadius = UDim.new(0, 20)
+    PanelCorner.Parent = Panel
     
-    -- Thanh tiêu đề
-    local TitleBar = Instance.new("Frame")
-    TitleBar.Name = "TitleBar"
-    TitleBar.Parent = MainFrame
-    TitleBar.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
-    TitleBar.BorderSizePixel = 0
-    TitleBar.Size = UDim2.new(1, 0, 0, 42)
+    local PanelStroke = Instance.new("UIStroke")
+    PanelStroke.Parent = Panel
+    PanelStroke.Thickness = 1
+    PanelStroke.Color = Color3.fromRGB(50, 50, 55)
+    PanelStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
     
-    local TitleCorner = Instance.new("UICorner")
-    TitleCorner.CornerRadius = UDim.new(0, 12)
-    TitleCorner.Parent = TitleBar
+    -- Tiêu đề
+    local Title = Instance.new("TextLabel")
+    Title.Name = "Title"
+    Title.Parent = Panel
+    Title.BackgroundTransparency = 1
+    Title.Size = UDim2.new(1, 0, 0, 30)
+    Title.Position = UDim2.new(0, 0, 0, 10)
+    Title.Font = Enum.Font.GothamBold
+    Title.Text = "🎰 Always Double"
+    Title.TextColor3 = Color3.fromRGB(255, 210, 50)
+    Title.TextSize = 16
     
-    -- Che nửa dưới bo góc
-    local TitleCover = Instance.new("Frame")
-    TitleCover.Name = "TitleCover"
-    TitleCover.Parent = TitleBar
-    TitleCover.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
-    TitleCover.BorderSizePixel = 0
-    TitleCover.Position = UDim2.new(0, 0, 0.5, 0)
-    TitleCover.Size = UDim2.new(1, 0, 0.5, 0)
+    -- ==========================================
+    -- SWITCH CONTAINER (KIỂU iOS/ANDROID)
+    -- ==========================================
+    local SwitchContainer = Instance.new("Frame")
+    SwitchContainer.Name = "SwitchContainer"
+    SwitchContainer.Parent = Panel
+    SwitchContainer.BackgroundTransparency = 1
+    SwitchContainer.Size = UDim2.new(0, 70, 0, 36)
+    SwitchContainer.Position = UDim2.new(1, -85, 0, 50)
     
-    -- Icon + Text
-    local TitleText = Instance.new("TextLabel")
-    TitleText.Name = "TitleText"
-    TitleText.Parent = TitleBar
-    TitleText.BackgroundTransparency = 1
-    TitleText.Size = UDim2.new(1, 0, 1, 0)
-    TitleText.Font = Enum.Font.GothamBold
-    TitleText.Text = "🎰  ALWAYS DOUBLE"
-    TitleText.TextColor3 = Color3.fromRGB(255, 210, 0)
-    TitleText.TextSize = 16
-    TitleText.TextStrokeTransparency = 0.7
+    -- Background Switch (Track)
+    local SwitchTrack = Instance.new("Frame")
+    SwitchTrack.Name = "SwitchTrack"
+    SwitchTrack.Parent = SwitchContainer
+    SwitchTrack.BackgroundColor3 = Color3.fromRGB(70, 70, 75) -- Xám (OFF)
+    SwitchTrack.BorderSizePixel = 0
+    SwitchTrack.Size = UDim2.new(1, 0, 1, 0)
     
-    -- Nút ON/OFF chính
-    local ToggleButton = Instance.new("TextButton")
-    ToggleButton.Name = "ToggleButton"
-    ToggleButton.Parent = MainFrame
-    ToggleButton.BackgroundColor3 = Color3.fromRGB(200, 45, 45) -- Đỏ = OFF
-    ToggleButton.BorderSizePixel = 0
-    ToggleButton.Position = UDim2.new(0.1, 0, 0.28, 0)
-    ToggleButton.Size = UDim2.new(0.8, 0, 0, 56)
-    ToggleButton.Font = Enum.Font.GothamBlack
-    ToggleButton.Text = "OFF"
-    ToggleButton.TextColor3 = Color3.fromRGB(255, 255, 255)
-    ToggleButton.TextSize = 28
-    ToggleButton.AutoButtonColor = false
+    local TrackCorner = Instance.new("UICorner")
+    TrackCorner.CornerRadius = UDim.new(1, 0)
+    TrackCorner.Parent = SwitchTrack
     
-    local BtnCorner = Instance.new("UICorner")
-    BtnCorner.CornerRadius = UDim.new(0, 10)
-    BtnCorner.Parent = ToggleButton
+    -- Nút tròn (Thumb)
+    local SwitchThumb = Instance.new("Frame")
+    SwitchThumb.Name = "SwitchThumb"
+    SwitchThumb.Parent = SwitchTrack
+    SwitchThumb.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+    SwitchThumb.BorderSizePixel = 0
+    SwitchThumb.Size = UDim2.new(0, 30, 0, 30)
+    SwitchThumb.Position = UDim2.new(0, 3, 0.5, -15) -- Bên trái = OFF
     
-    -- Hiệu ứng bóng nút
-    local BtnStroke = Instance.new("UIStroke")
-    BtnStroke.Parent = ToggleButton
-    BtnStroke.Thickness = 2
-    BtnStroke.Color = Color3.fromRGB(255, 80, 80)
-    BtnStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    local ThumbCorner = Instance.new("UICorner")
+    ThumbCorner.CornerRadius = UDim.new(1, 0)
+    ThumbCorner.Parent = SwitchThumb
     
-    -- Label trạng thái
+    -- Bóng cho nút tròn
+    local ThumbShadow = Instance.new("ImageLabel")
+    ThumbShadow.Name = "Shadow"
+    ThumbShadow.Parent = SwitchThumb
+    ThumbShadow.BackgroundTransparency = 1
+    ThumbShadow.Size = UDim2.new(1.2, 0, 1.2, 0)
+    ThumbShadow.Position = UDim2.new(-0.1, 0, -0.1, 0)
+    ThumbShadow.Image = "rbxassetid://6015897843"
+    ThumbShadow.ImageTransparency = 0.6
+    ThumbShadow.ScaleType = Enum.ScaleType.Slice
+    ThumbShadow.SliceCenter = Rect.new(8, 8, 8, 8)
+    
+    -- Nhãn trạng thái
     local StatusLabel = Instance.new("TextLabel")
     StatusLabel.Name = "StatusLabel"
-    StatusLabel.Parent = MainFrame
+    StatusLabel.Parent = Panel
     StatusLabel.BackgroundTransparency = 1
-    StatusLabel.Position = UDim2.new(0.05, 0, 0.6, 0)
-    StatusLabel.Size = UDim2.new(0.9, 0, 0, 28)
+    StatusLabel.Size = UDim2.new(0, 120, 0, 28)
+    StatusLabel.Position = UDim2.new(0, 20, 0, 52)
     StatusLabel.Font = Enum.Font.GothamBold
-    StatusLabel.Text = "🔴 CƠ CHẾ GỐC (40%)"
+    StatusLabel.Text = "OFF"
     StatusLabel.TextColor3 = Color3.fromRGB(255, 100, 100)
-    StatusLabel.TextSize = 13
+    StatusLabel.TextSize = 18
+    StatusLabel.TextXAlignment = Enum.TextXAlignment.Left
     
-    -- Label phương pháp
-    local MethodLabel = Instance.new("TextLabel")
-    MethodLabel.Name = "MethodLabel"
-    MethodLabel.Parent = MainFrame
-    MethodLabel.BackgroundTransparency = 1
-    MethodLabel.Position = UDim2.new(0.05, 0, 0.74, 0)
-    MethodLabel.Size = UDim2.new(0.9, 0, 0, 20)
-    MethodLabel.Font = Enum.Font.Gotham
-    MethodLabel.Text = "Signal Hook + Math Hook"
-    MethodLabel.TextColor3 = Color3.fromRGB(160, 160, 160)
-    MethodLabel.TextSize = 10
-    
-    -- Label phím tắt
-    local HotkeyLabel = Instance.new("TextLabel")
-    HotkeyLabel.Name = "HotkeyLabel"
-    HotkeyLabel.Parent = MainFrame
-    HotkeyLabel.BackgroundTransparency = 1
-    HotkeyLabel.Position = UDim2.new(0.05, 0, 0.86, 0)
-    HotkeyLabel.Size = UDim2.new(0.9, 0, 0, 22)
-    HotkeyLabel.Font = Enum.Font.Gotham
-    HotkeyLabel.Text = "⌨ F6 = Bật/Tắt nhanh"
-    HotkeyLabel.TextColor3 = Color3.fromRGB(180, 180, 180)
-    HotkeyLabel.TextSize = 10
+    -- Nhãn mô tả
+    local DescLabel = Instance.new("TextLabel")
+    DescLabel.Name = "DescLabel"
+    DescLabel.Parent = Panel
+    DescLabel.BackgroundTransparency = 1
+    DescLabel.Size = UDim2.new(1, -40, 0, 22)
+    DescLabel.Position = UDim2.new(0, 20, 0, 100)
+    DescLabel.Font = Enum.Font.Gotham
+    DescLabel.Text = "Nhấn công tắc để bật/tắt"
+    DescLabel.TextColor3 = Color3.fromRGB(150, 150, 155)
+    DescLabel.TextSize = 11
+    DescLabel.TextXAlignment = Enum.TextXAlignment.Left
     
     -- ==========================================
-    -- CẬP NHẬT GIAO DIỆN
+    -- ANIMATION SWITCH
     -- ==========================================
-    local function UpdateUI()
-        if IsEnabled then
-            ToggleButton.BackgroundColor3 = Color3.fromRGB(46, 204, 113) -- Xanh = ON
-            ToggleButton.Text = "ON"
-            BtnStroke.Color = Color3.fromRGB(80, 255, 130)
-            StatusLabel.Text = "🟢 LUÔN DOUBLE (100%)"
-            StatusLabel.TextColor3 = Color3.fromRGB(46, 204, 113)
+    local SwitchTween = nil
+    
+    local function AnimateSwitch(on)
+        local thumbGoal
+        local trackColor
+        local statusText
+        local statusColor
+        
+        if on then
+            thumbGoal = UDim2.new(1, -33, 0.5, -15) -- Phải = ON
+            trackColor = Color3.fromRGB(52, 199, 89)  -- Xanh iOS
+            statusText = "ON"
+            statusColor = Color3.fromRGB(52, 199, 89)
         else
-            ToggleButton.BackgroundColor3 = Color3.fromRGB(200, 45, 45) -- Đỏ = OFF
-            ToggleButton.Text = "OFF"
-            BtnStroke.Color = Color3.fromRGB(255, 80, 80)
-            StatusLabel.Text = "🔴 CƠ CHẾ GỐC (40%)"
-            StatusLabel.TextColor3 = Color3.fromRGB(255, 100, 100)
+            thumbGoal = UDim2.new(0, 3, 0.5, -15)    -- Trái = OFF
+            trackColor = Color3.fromRGB(70, 70, 75)   -- Xám
+            statusText = "OFF"
+            statusColor = Color3.fromRGB(255, 100, 100)
         end
+        
+        -- Hủy tween cũ
+        if SwitchTween then SwitchTween:Cancel() end
+        
+        -- Tween thumb
+        local thumbInfo = TweenInfo.new(0.25, Enum.EasingStyle.Quart, Enum.EasingDirection.Out)
+        SwitchTween = TweenService:Create(SwitchThumb, thumbInfo, {Position = thumbGoal})
+        SwitchTween:Play()
+        
+        -- Tween track color
+        local trackInfo = TweenInfo.new(0.25, Enum.EasingStyle.Linear)
+        TweenService:Create(SwitchTrack, trackInfo, {BackgroundColor3 = trackColor}):Play()
+        
+        -- Cập nhật text
+        StatusLabel.Text = statusText
+        StatusLabel.TextColor3 = statusColor
     end
     
     -- ==========================================
-    -- SỰ KIỆN
+    -- SỰ KIỆN NHẤN
     -- ==========================================
-    ToggleButton.MouseButton1Click:Connect(function()
+    local ClickDetector = Instance.new("TextButton")
+    ClickDetector.Name = "ClickDetector"
+    ClickDetector.Parent = SwitchContainer
+    ClickDetector.BackgroundTransparency = 1
+    ClickDetector.Size = UDim2.new(1.5, 0, 1.5, 0)
+    ClickDetector.Position = UDim2.new(-0.25, 0, -0.25, 0)
+    ClickDetector.Text = ""
+    
+    ClickDetector.MouseButton1Click:Connect(function()
         Toggle()
-        UpdateUI()
+        AnimateSwitch(IsEnabled)
     end)
     
-    UserInputService.InputBegan:Connect(function(input, gameProcessed)
-        if gameProcessed then return end
-        if input.KeyCode == Enum.KeyCode.F6 then
-            Toggle()
-            UpdateUI()
+    -- Hỗ trợ chạm (mobile)
+    ClickDetector.TouchTap:Connect(function()
+        Toggle()
+        AnimateSwitch(IsEnabled)
+    end)
+    
+    -- ==========================================
+    -- NÚT ẨN/HIỆN PANEL
+    -- ==========================================
+    local MinimizeBtn = Instance.new("TextButton")
+    MinimizeBtn.Name = "MinimizeBtn"
+    MinimizeBtn.Parent = Panel
+    MinimizeBtn.BackgroundColor3 = Color3.fromRGB(40, 40, 45)
+    MinimizeBtn.BorderSizePixel = 0
+    MinimizeBtn.Size = UDim2.new(0, 24, 0, 24)
+    MinimizeBtn.Position = UDim2.new(1, -30, 0, 8)
+    MinimizeBtn.Font = Enum.Font.GothamBold
+    MinimizeBtn.Text = "−"
+    MinimizeBtn.TextColor3 = Color3.fromRGB(200, 200, 200)
+    MinimizeBtn.TextSize = 16
+    
+    local BtnCorner = Instance.new("UICorner")
+    BtnCorner.CornerRadius = UDim.new(1, 0)
+    BtnCorner.Parent = MinimizeBtn
+    
+    local isMinimized = false
+    
+    MinimizeBtn.MouseButton1Click:Connect(function()
+        isMinimized = not isMinimized
+        if isMinimized then
+            Panel.Size = UDim2.new(0, 280, 0, 50)
+            MinimizeBtn.Text = "+"
+        else
+            Panel.Size = UDim2.new(0, 280, 0, 140)
+            MinimizeBtn.Text = "−"
         end
     end)
     
     -- Khởi tạo
-    UpdateUI()
+    AnimateSwitch(false)
     
-    return ScreenGui
+    return SG
 end
 
 -- ==========================================
 -- KHỞI CHẠY
 -- ==========================================
-local GUI = CreateGUI()
+local GUI = CreateMobileSwitchUI()
 
 print([[
 ============================================
-  ALWAYS DOUBLE - GROW A GARDEN 2
-  VERSION 4.0 FINAL
-  
-  [ON]  = Luôn DOUBLE (100%)
-  [OFF] = Cơ chế gốc (40%)
-  [F6]  = Bật/Tắt nhanh
+  ALWAYS DOUBLE - MOBILE EDITION
+  [ON]  = Luôn DOUBLE
+  [OFF] = Cơ chế gốc 40%
+  Nhấn công tắc để bật/tắt
 ============================================
 ]])
 
@@ -496,27 +402,4 @@ print([[
 LocalPlayer.Idled:Connect(function()
     VirtualUser:CaptureController()
     VirtualUser:ClickButton2(Vector2.new())
-end)
-
--- Tự động bật khi vào game (tùy chọn)
-task.spawn(function()
-    task.wait(2)
-    -- Bỏ comment dòng dưới nếu muốn tự động bật
-    -- Enable()
-    -- UpdateUI()
-end)
-
--- Debug: In tất cả RemoteEvent tìm thấy
-task.spawn(function()
-    task.wait(3)
-    local remotes = DeepFindAllRemotes()
-    print("\n========== DANH SÁCH REMOTE EVENT ==========")
-    for _, evt in ipairs(remotes.Events) do
-        print("  [Event] " .. evt:GetFullName())
-    end
-    print("\n========== DANH SÁCH REMOTE FUNCTION ==========")
-    for _, fn in ipairs(remotes.Functions) do
-        print("  [Func] " .. fn:GetFullName())
-    end
-    print("================================================\n")
 end)
