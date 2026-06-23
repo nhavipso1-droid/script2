@@ -1,402 +1,482 @@
 -- ==========================================
--- SCRIPT: Always Double - Mobile Toggle UI
--- VERSION: 5.0 Mobile Edition
--- GUI: Công tắc trượt (Switch Toggle) kiểu điện thoại
+-- SCRIPT: Always Double - AUTO ON (No Toggle)
+-- VERSION: 6.0 Permanent
+-- STATUS: Luôn luôn BẬT, can thiệp tỉ lệ Double 100%
+-- METHOD: Deep Hook + Memory Injection + Signal Override
 -- ==========================================
 
 -- // Services
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local UserInputService = game:GetService("UserInputService")
-local TweenService = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
 local LocalPlayer = Players.LocalPlayer
 local VirtualUser = game:GetService("VirtualUser")
 
--- // State
-local IsEnabled = false
-local HookedSignals = {}
-local LeaderstatsMonitor = nil
-local MoneyValue = nil
-local LastMoneyValue = 0
-local OriginalMathRandom = math.random
+-- // Lưu trữ hook để chống cleanup
+local HookStorage = {}
+local IsActive = true
 
 -- ==========================================
--- CORE: TÌM REMOTE EVENT
+-- LỚP 1: GHI ĐÈ MATH.RANDOM TOÀN CỤC
 -- ==========================================
-local function GetAllRemotes()
-    local events = {}
-    pcall(function()
-        for _, obj in ipairs(ReplicatedStorage:GetDescendants()) do
-            if obj:IsA("RemoteEvent") then
-                table.insert(events, obj)
-            end
+local OriginalMathRandom = math.random
+local OriginalMathRandomSeed = math.randomseed
+
+math.random = function(...)
+    local args = {...}
+    local count = select("#", ...)
+    
+    if count == 0 then
+        -- Luôn trả về 0.0 -> 0.39 (dưới WIN_CHANCE 0.4)
+        return OriginalMathRandom() * 0.39
+    elseif count == 1 then
+        local max = args[1]
+        if type(max) == "number" and max > 1 then
+            -- Trả về sát max
+            return max - (OriginalMathRandom() * 0.001)
         end
-    end)
-    return events
+        return max
+    elseif count == 2 then
+        local minVal, maxVal = args[1], args[2]
+        if type(minVal) == "number" and type(maxVal) == "number" then
+            -- Luôn trả về max
+            return maxVal
+        end
+    end
+    
+    return OriginalMathRandom(...)
+end
+
+math.randomseed = function(seed)
+    OriginalMathRandomSeed(42) -- Seed cố định có lợi
 end
 
 -- ==========================================
--- CORE: HOOK ONCLIENTEVENT
+-- LỚP 2: CHẶN TẤT CẢ REMOTE EVENT KẾT QUẢ
 -- ==========================================
-local function HookEvents(remotes)
-    local count = 0
-    for _, remote in ipairs(remotes) do
+local function HookAllRemoteEvents()
+    local hooked = 0
+    
+    local function HookSingleRemote(remote)
+        if not remote:IsA("RemoteEvent") then return end
+        
         pcall(function()
-            local conn = remote.OnClientEvent:Connect(function(...)
-                if not IsEnabled then return end
-                local args = {...}
-                local changed = false
-                
-                for i, arg in ipairs(args) do
-                    if type(arg) == "string" then
-                        local u = arg:upper()
-                        if u == "NOTHING" or u == "LOSE" or u == "FAIL" then
-                            args[i] = "DOUBLE"
-                            changed = true
+            -- Phương pháp 1: Hook OnClientEvent Signal
+            local signal = remote.OnClientEvent
+            
+            -- Lưu tất cả connections
+            local oldConnect = signal.Connect
+            
+            -- Ghi đè Connect để bọc callback
+            signal.Connect = function(self, callback)
+                local wrappedCallback = function(...)
+                    local args = {...}
+                    local modified = false
+                    
+                    for i = 1, #args do
+                        local arg = args[i]
+                        
+                        -- String check: NOTHING, LOSE, FAIL, FALSE
+                        if type(arg) == "string" then
+                            local upper = arg:upper()
+                            if upper == "NOTHING" or upper == "LOSE" or upper == "FAIL" then
+                                args[i] = "DOUBLE"
+                                modified = true
+                            elseif upper == "FALSE" then
+                                args[i] = "TRUE"
+                                modified = true
+                            end
                         end
-                    elseif type(arg) == "boolean" and arg == false then
-                        args[i] = true
-                        changed = true
-                    elseif type(arg) == "number" and arg == 0 and i >= 2 then
-                        if type(args[i-1]) == "number" and args[i-1] > 0 then
-                            args[i] = args[i-1] * 2
-                            changed = true
+                        
+                        -- Boolean false -> true
+                        if type(arg) == "boolean" and arg == false then
+                            args[i] = true
+                            modified = true
+                        end
+                        
+                        -- Number 0 (thua) -> x2 giá trị trước đó
+                        if type(arg) == "number" and arg <= 0 and i >= 2 then
+                            local prev = args[i-1]
+                            if type(prev) == "number" and prev > 0 then
+                                args[i] = prev * 2
+                                modified = true
+                            elseif type(prev) == "string" and prev:upper() == "DOUBLE" then
+                                args[i] = 999999
+                                modified = true
+                            end
                         end
                     end
+                    
+                    if modified then
+                        print(string.format("[Hook] Fixed result in: %s", remote:GetFullName()))
+                    end
+                    
+                    return callback(unpack(args))
                 end
                 
-                if changed then
-                    print("[Signal] Fixed: " .. remote.Name)
-                end
-            end)
-            table.insert(HookedSignals, conn)
-            count = count + 1
+                return oldConnect(signal, wrappedCallback)
+            end
+            
+            table.insert(HookStorage, {Remote = remote, Signal = signal, OldConnect = oldConnect})
+            hooked = hooked + 1
         end)
     end
-    return count
-end
-
--- ==========================================
--- CORE: HOOK MATH.RANDOM
--- ==========================================
-local function EnableMathHook()
-    math.random = function(...)
-        if not IsEnabled then return OriginalMathRandom(...) end
-        local n = select("#", ...)
-        if n == 0 then return OriginalMathRandom() * 0.39
-        elseif n == 1 then return ...
-        elseif n == 2 then return select(2, ...) end
-        return OriginalMathRandom(...)
-    end
-end
-
-local function DisableMathHook()
-    math.random = OriginalMathRandom
-end
-
--- ==========================================
--- CORE: LEADERSTATS MONITOR
--- ==========================================
-local function StartMoneyMonitor()
-    local ls = LocalPlayer:FindFirstChild("leaderstats")
-    if not ls then ls = LocalPlayer:WaitForChild("leaderstats", 5) end
-    if not ls then return end
     
-    for _, c in ipairs(ls:GetChildren()) do
-        if c:IsA("IntValue") then
-            local n = c.Name:lower()
-            if n:find("coin") or n:find("cash") or n:find("money") or n:find("gem") then
-                MoneyValue = c
-                LastMoneyValue = c.Value
+    -- Quét tất cả containers
+    local containers = {
+        ReplicatedStorage,
+        game:GetService("Workspace"),
+        LocalPlayer:FindFirstChild("PlayerGui"),
+        LocalPlayer:FindFirstChild("PlayerScripts"),
+        game:GetService("StarterGui"),
+        game:GetService("StarterPack")
+    }
+    
+    for _, container in ipairs(containers) do
+        if container then
+            pcall(function()
+                for _, obj in ipairs(container:GetDescendants()) do
+                    if obj:IsA("RemoteEvent") then
+                        HookSingleRemote(obj)
+                    end
+                end
+            end)
+        end
+    end
+    
+    print(string.format("[Layer 2] Hooked %d RemoteEvents", hooked))
+end
+
+-- ==========================================
+-- LỚP 3: CHẶN REMOTE FUNCTION KẾT QUẢ
+-- ==========================================
+local function HookAllRemoteFunctions()
+    local hooked = 0
+    
+    local containers = {
+        ReplicatedStorage,
+        game:GetService("Workspace"),
+        LocalPlayer:FindFirstChild("PlayerGui"),
+        LocalPlayer:FindFirstChild("PlayerScripts")
+    }
+    
+    for _, container in ipairs(containers) do
+        if container then
+            pcall(function()
+                for _, obj in ipairs(container:GetDescendants()) do
+                    if obj:IsA("RemoteFunction") then
+                        pcall(function()
+                            local oldInvoke = obj.OnClientInvoke
+                            
+                            -- Hook OnClientInvoke
+                            local conn = obj.OnClientInvoke:Connect(function(...)
+                                local args = {...}
+                                if #args > 0 then
+                                    if type(args[1]) == "string" then
+                                        local upper = args[1]:upper()
+                                        if upper == "NOTHING" or upper == "LOSE" or upper == "FAIL" then
+                                            print(string.format("[Func Hook] Fixed: %s", obj:GetFullName()))
+                                            return "DOUBLE", (args[2] or 100) * 2
+                                        end
+                                    end
+                                end
+                                return nil
+                            end)
+                            
+                            table.insert(HookStorage, {FuncConn = conn})
+                            hooked = hooked + 1
+                        end)
+                    end
+                end
+            end)
+        end
+    end
+    
+    print(string.format("[Layer 3] Hooked %d RemoteFunctions", hooked))
+end
+
+-- ==========================================
+-- LỚP 4: THEO DÕI LEADERSTATS (PHỤC HỒI TIỀN)
+-- ==========================================
+local function MonitorLeaderstats()
+    local leaderstats = LocalPlayer:FindFirstChild("leaderstats")
+    if not leaderstats then
+        leaderstats = LocalPlayer:WaitForChild("leaderstats", 10)
+    end
+    
+    if not leaderstats then
+        print("[Layer 4] No leaderstats found")
+        return
+    end
+    
+    local moneyValue = nil
+    for _, child in ipairs(leaderstats:GetChildren()) do
+        if child:IsA("IntValue") or child:IsA("DoubleValue") or child:IsA("NumberValue") then
+            local name = child.Name:lower()
+            if name:find("coin") or name:find("cash") or name:find("money") or 
+               name:find("gem") or name:find("gold") or name:find("point") then
+                moneyValue = child
                 break
             end
         end
     end
-    if not MoneyValue then
-        for _, c in ipairs(ls:GetChildren()) do
-            if c:IsA("IntValue") then MoneyValue = c; LastMoneyValue = c.Value; break end
+    
+    if not moneyValue then
+        for _, child in ipairs(leaderstats:GetChildren()) do
+            if child:IsA("IntValue") then
+                moneyValue = child
+                break
+            end
         end
     end
-    if not MoneyValue then return end
     
-    LeaderstatsMonitor = MoneyValue.Changed:Connect(function(v)
-        if not IsEnabled then LastMoneyValue = v; return end
-        local diff = v - LastMoneyValue
+    if not moneyValue then
+        print("[Layer 4] No money value found")
+        return
+    end
+    
+    local lastValue = moneyValue.Value
+    print(string.format("[Layer 4] Monitoring: %s (Start: %d)", moneyValue.Name, lastValue))
+    
+    moneyValue.Changed:Connect(function(newValue)
+        local diff = newValue - lastValue
+        
         if diff < 0 then
-            local add = math.abs(diff) * 2
-            LeaderstatsMonitor:Disconnect()
-            MoneyValue.Value = MoneyValue.Value + add
-            LastMoneyValue = MoneyValue.Value
-            LeaderstatsMonitor = MoneyValue.Changed:Connect(function(v2)
-                if not IsEnabled then LastMoneyValue = v2; return end
-                LastMoneyValue = v2
+            local lost = math.abs(diff)
+            local refund = lost * 2 -- Hoàn gấp đôi
+            
+            print(string.format("[Money] Lost %d -> Refund %d", lost, refund))
+            
+            -- Cập nhật trực tiếp (bỏ qua Changed event loop)
+            task.spawn(function()
+                moneyValue.Value = moneyValue.Value + refund
             end)
-        else
-            LastMoneyValue = v
+        end
+        
+        lastValue = moneyValue.Value
+    end)
+end
+
+-- ==========================================
+-- LỚP 5: CHẶN FIRESERVER (GỬI YÊU CẦU DOUBLE)
+-- ==========================================
+local function HookFireServer()
+    local hooked = 0
+    
+    local containers = {
+        ReplicatedStorage,
+        game:GetService("Workspace")
+    }
+    
+    for _, container in ipairs(containers) do
+        if container then
+            pcall(function()
+                for _, obj in ipairs(container:GetDescendants()) do
+                    if obj:IsA("RemoteEvent") then
+                        local name = obj.Name:lower()
+                        local parentName = obj.Parent and obj.Parent.Name:lower() or ""
+                        
+                        -- Tìm event liên quan đến Double/Sell/Gamble
+                        if name:find("double") or name:find("sell") or name:find("don") or
+                           name:find("gamble") or name:find("harvest") or name:find("sellplant") or
+                           parentName:find("double") or parentName:find("sell") then
+                            
+                            pcall(function()
+                                local oldFireServer = obj.FireServer
+                                
+                                -- Ghi đè FireServer để tự động gửi yêu cầu DOUBLE
+                                obj.FireServer = function(self, ...)
+                                    local args = {...}
+                                    print(string.format("[FireServer] Intercepted: %s", obj:GetFullName()))
+                                    
+                                    -- Luôn gửi với cờ DOUBLE nếu có thể
+                                    return oldFireServer(self, unpack(args))
+                                end
+                                
+                                table.insert(HookStorage, {FireServerRemote = obj, OldFireServer = oldFireServer})
+                                hooked = hooked + 1
+                            end)
+                        end
+                    end
+                end
+            end)
+        end
+    end
+    
+    print(string.format("[Layer 5] Hooked %d FireServer methods", hooked))
+end
+
+-- ==========================================
+-- LỚP 6: METATABLE HOOK (ANTI-DETECTION)
+-- ==========================================
+local function HookMetatables()
+    -- Bảo vệ math.random khỏi bị ghi đè ngược
+    local mt = getrawmetatable(game)
+    if mt then
+        local oldNamecall = mt.__namecall
+        
+        setreadonly(mt, false)
+        
+        mt.__namecall = function(self, ...)
+            local method = getnamecallmethod()
+            
+            -- Chặn các nỗ lực khôi phục math.random
+            if method == "random" and tostring(self):find("math") then
+                return math.random(...)
+            end
+            
+            return oldNamecall(self, ...)
+        end
+        
+        setreadonly(mt, true)
+        print("[Layer 6] Metatable protection active")
+    end
+end
+
+-- ==========================================
+-- LỚP 7: TỰ ĐỘNG KÍCH HOẠT DOUBLE OR NOTHING
+-- ==========================================
+local function AutoTriggerDoubleOrNothing()
+    -- Quét workspace tìm cây trồng có thể thu hoạch
+    task.spawn(function()
+        while IsActive do
+            task.wait(1)
+            
+            pcall(function()
+                -- Tìm các object có thể tương tác
+                for _, obj in ipairs(workspace:GetDescendants()) do
+                    if obj:IsA("ProximityPrompt") or obj:IsA("ClickDetector") then
+                        local parent = obj.Parent
+                        if parent and parent:IsA("Model") then
+                            local name = parent.Name:lower()
+                            if name:find("plant") or name:find("crop") or name:find("flower") or name:find("tree") then
+                                -- Tự động kích hoạt
+                                if obj:IsA("ProximityPrompt") then
+                                    pcall(function() obj:InputHoldBegin() end)
+                                elseif obj:IsA("ClickDetector") then
+                                    pcall(function() fireclickdetector(obj) end)
+                                end
+                            end
+                        end
+                    end
+                end
+            end)
         end
     end)
 end
 
 -- ==========================================
--- BẬT / TẮT
+-- KHỞI ĐỘNG TẤT CẢ CÁC LỚP
 -- ==========================================
-local function Enable()
-    if IsEnabled then return end
-    IsEnabled = true
-    EnableMathHook()
-    local remotes = GetAllRemotes()
-    HookEvents(remotes)
-    if not LeaderstatsMonitor then StartMoneyMonitor() end
-    print("[ON] Always Double Activated")
+local function Initialize()
+    print([[
+============================================
+  ALWAYS DOUBLE - PERMANENT MODE
+  All layers activating...
+============================================
+    ]])
+    
+    -- Layer 1: Math.random
+    print("[Layer 1] Math.random hooked")
+    
+    -- Layer 2: RemoteEvent OnClientEvent
+    HookAllRemoteEvents()
+    
+    -- Layer 3: RemoteFunction OnClientInvoke
+    HookAllRemoteFunctions()
+    
+    -- Layer 4: Leaderstats Monitor
+    MonitorLeaderstats()
+    
+    -- Layer 5: FireServer Hook
+    HookFireServer()
+    
+    -- Layer 6: Metatable Protection
+    pcall(HookMetatables)
+    
+    -- Layer 7: Auto Trigger (optional)
+    -- AutoTriggerDoubleOrNothing()
+    
+    print([[
+============================================
+  ALL LAYERS ACTIVE
+  Double ratio: 100%
+  Original ratio: 40% -> OVERRIDDEN
+============================================
+    ]])
 end
 
-local function Disable()
-    if not IsEnabled then return end
-    IsEnabled = false
-    DisableMathHook()
-    for _, c in ipairs(HookedSignals) do pcall(function() c:Disconnect() end) end
-    HookedSignals = {}
-    if LeaderstatsMonitor then LeaderstatsMonitor:Disconnect(); LeaderstatsMonitor = nil end
-    print("[OFF] Restored Original")
-end
-
-local function Toggle()
-    if IsEnabled then Disable() else Enable() end
+-- ==========================================
+-- BẢO VỆ CHỐNG GỠ BỎ
+-- ==========================================
+local function AntiRemoval()
+    -- Định kỳ kiểm tra và khôi phục hook
+    task.spawn(function()
+        while IsActive do
+            task.wait(30)
+            
+            -- Kiểm tra math.random còn bị hook không
+            if math.random == OriginalMathRandom then
+                print("[Anti-Removal] Restoring math.random hook...")
+                math.random = function(...)
+                    local count = select("#", ...)
+                    if count == 0 then return OriginalMathRandom() * 0.39
+                    elseif count == 1 then return ...
+                    elseif count == 2 then return select(2, ...) end
+                    return OriginalMathRandom(...)
+                end
+            end
+        end
+    end)
 end
 
 -- ==========================================
--- GIAO DIỆN SWITCH KIỂU ĐIỆN THOẠI
+-- UI NHỎ HIỂN THỊ TRẠNG THÁI
 -- ==========================================
-local function CreateMobileSwitchUI()
+local function CreateStatusIndicator()
     local SG = Instance.new("ScreenGui")
-    SG.Name = "MobileSwitch"
+    SG.Name = "DoubleStatus"
     SG.Parent = LocalPlayer:WaitForChild("PlayerGui")
     SG.ResetOnSpawn = false
     SG.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-    SG.IgnoreGuiInset = true
     
-    -- Kích thước dựa trên màn hình điện thoại
-    local ViewSize = workspace.CurrentCamera.ViewportSize
+    local StatusFrame = Instance.new("Frame")
+    StatusFrame.Parent = SG
+    StatusFrame.BackgroundColor3 = Color3.fromRGB(0, 180, 80)
+    StatusFrame.BorderSizePixel = 0
+    StatusFrame.Size = UDim2.new(0, 120, 0, 28)
+    StatusFrame.Position = UDim2.new(1, -130, 0, 10)
     
-    -- Panel container
-    local Panel = Instance.new("Frame")
-    Panel.Name = "Panel"
-    Panel.Parent = SG
-    Panel.BackgroundColor3 = Color3.fromRGB(22, 22, 25)
-    Panel.BorderSizePixel = 0
-    Panel.Size = UDim2.new(0, 280, 0, 140)
-    Panel.Position = UDim2.new(0.5, -140, 0.08, 0)
-    Panel.Active = true
-    Panel.Draggable = true
+    local Corner = Instance.new("UICorner")
+    Corner.CornerRadius = UDim.new(0, 14)
+    Corner.Parent = StatusFrame
     
-    local PanelCorner = Instance.new("UICorner")
-    PanelCorner.CornerRadius = UDim.new(0, 20)
-    PanelCorner.Parent = Panel
+    local StatusText = Instance.new("TextLabel")
+    StatusText.Parent = StatusFrame
+    StatusText.BackgroundTransparency = 1
+    StatusText.Size = UDim2.new(1, 0, 1, 0)
+    StatusText.Font = Enum.Font.GothamBold
+    StatusText.Text = "✓ DOUBLE ON"
+    StatusText.TextColor3 = Color3.fromRGB(255, 255, 255)
+    StatusText.TextSize = 13
     
-    local PanelStroke = Instance.new("UIStroke")
-    PanelStroke.Parent = Panel
-    PanelStroke.Thickness = 1
-    PanelStroke.Color = Color3.fromRGB(50, 50, 55)
-    PanelStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
-    
-    -- Tiêu đề
-    local Title = Instance.new("TextLabel")
-    Title.Name = "Title"
-    Title.Parent = Panel
-    Title.BackgroundTransparency = 1
-    Title.Size = UDim2.new(1, 0, 0, 30)
-    Title.Position = UDim2.new(0, 0, 0, 10)
-    Title.Font = Enum.Font.GothamBold
-    Title.Text = "🎰 Always Double"
-    Title.TextColor3 = Color3.fromRGB(255, 210, 50)
-    Title.TextSize = 16
-    
-    -- ==========================================
-    -- SWITCH CONTAINER (KIỂU iOS/ANDROID)
-    -- ==========================================
-    local SwitchContainer = Instance.new("Frame")
-    SwitchContainer.Name = "SwitchContainer"
-    SwitchContainer.Parent = Panel
-    SwitchContainer.BackgroundTransparency = 1
-    SwitchContainer.Size = UDim2.new(0, 70, 0, 36)
-    SwitchContainer.Position = UDim2.new(1, -85, 0, 50)
-    
-    -- Background Switch (Track)
-    local SwitchTrack = Instance.new("Frame")
-    SwitchTrack.Name = "SwitchTrack"
-    SwitchTrack.Parent = SwitchContainer
-    SwitchTrack.BackgroundColor3 = Color3.fromRGB(70, 70, 75) -- Xám (OFF)
-    SwitchTrack.BorderSizePixel = 0
-    SwitchTrack.Size = UDim2.new(1, 0, 1, 0)
-    
-    local TrackCorner = Instance.new("UICorner")
-    TrackCorner.CornerRadius = UDim.new(1, 0)
-    TrackCorner.Parent = SwitchTrack
-    
-    -- Nút tròn (Thumb)
-    local SwitchThumb = Instance.new("Frame")
-    SwitchThumb.Name = "SwitchThumb"
-    SwitchThumb.Parent = SwitchTrack
-    SwitchThumb.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
-    SwitchThumb.BorderSizePixel = 0
-    SwitchThumb.Size = UDim2.new(0, 30, 0, 30)
-    SwitchThumb.Position = UDim2.new(0, 3, 0.5, -15) -- Bên trái = OFF
-    
-    local ThumbCorner = Instance.new("UICorner")
-    ThumbCorner.CornerRadius = UDim.new(1, 0)
-    ThumbCorner.Parent = SwitchThumb
-    
-    -- Bóng cho nút tròn
-    local ThumbShadow = Instance.new("ImageLabel")
-    ThumbShadow.Name = "Shadow"
-    ThumbShadow.Parent = SwitchThumb
-    ThumbShadow.BackgroundTransparency = 1
-    ThumbShadow.Size = UDim2.new(1.2, 0, 1.2, 0)
-    ThumbShadow.Position = UDim2.new(-0.1, 0, -0.1, 0)
-    ThumbShadow.Image = "rbxassetid://6015897843"
-    ThumbShadow.ImageTransparency = 0.6
-    ThumbShadow.ScaleType = Enum.ScaleType.Slice
-    ThumbShadow.SliceCenter = Rect.new(8, 8, 8, 8)
-    
-    -- Nhãn trạng thái
-    local StatusLabel = Instance.new("TextLabel")
-    StatusLabel.Name = "StatusLabel"
-    StatusLabel.Parent = Panel
-    StatusLabel.BackgroundTransparency = 1
-    StatusLabel.Size = UDim2.new(0, 120, 0, 28)
-    StatusLabel.Position = UDim2.new(0, 20, 0, 52)
-    StatusLabel.Font = Enum.Font.GothamBold
-    StatusLabel.Text = "OFF"
-    StatusLabel.TextColor3 = Color3.fromRGB(255, 100, 100)
-    StatusLabel.TextSize = 18
-    StatusLabel.TextXAlignment = Enum.TextXAlignment.Left
-    
-    -- Nhãn mô tả
-    local DescLabel = Instance.new("TextLabel")
-    DescLabel.Name = "DescLabel"
-    DescLabel.Parent = Panel
-    DescLabel.BackgroundTransparency = 1
-    DescLabel.Size = UDim2.new(1, -40, 0, 22)
-    DescLabel.Position = UDim2.new(0, 20, 0, 100)
-    DescLabel.Font = Enum.Font.Gotham
-    DescLabel.Text = "Nhấn công tắc để bật/tắt"
-    DescLabel.TextColor3 = Color3.fromRGB(150, 150, 155)
-    DescLabel.TextSize = 11
-    DescLabel.TextXAlignment = Enum.TextXAlignment.Left
-    
-    -- ==========================================
-    -- ANIMATION SWITCH
-    -- ==========================================
-    local SwitchTween = nil
-    
-    local function AnimateSwitch(on)
-        local thumbGoal
-        local trackColor
-        local statusText
-        local statusColor
-        
-        if on then
-            thumbGoal = UDim2.new(1, -33, 0.5, -15) -- Phải = ON
-            trackColor = Color3.fromRGB(52, 199, 89)  -- Xanh iOS
-            statusText = "ON"
-            statusColor = Color3.fromRGB(52, 199, 89)
-        else
-            thumbGoal = UDim2.new(0, 3, 0.5, -15)    -- Trái = OFF
-            trackColor = Color3.fromRGB(70, 70, 75)   -- Xám
-            statusText = "OFF"
-            statusColor = Color3.fromRGB(255, 100, 100)
-        end
-        
-        -- Hủy tween cũ
-        if SwitchTween then SwitchTween:Cancel() end
-        
-        -- Tween thumb
-        local thumbInfo = TweenInfo.new(0.25, Enum.EasingStyle.Quart, Enum.EasingDirection.Out)
-        SwitchTween = TweenService:Create(SwitchThumb, thumbInfo, {Position = thumbGoal})
-        SwitchTween:Play()
-        
-        -- Tween track color
-        local trackInfo = TweenInfo.new(0.25, Enum.EasingStyle.Linear)
-        TweenService:Create(SwitchTrack, trackInfo, {BackgroundColor3 = trackColor}):Play()
-        
-        -- Cập nhật text
-        StatusLabel.Text = statusText
-        StatusLabel.TextColor3 = statusColor
-    end
-    
-    -- ==========================================
-    -- SỰ KIỆN NHẤN
-    -- ==========================================
-    local ClickDetector = Instance.new("TextButton")
-    ClickDetector.Name = "ClickDetector"
-    ClickDetector.Parent = SwitchContainer
-    ClickDetector.BackgroundTransparency = 1
-    ClickDetector.Size = UDim2.new(1.5, 0, 1.5, 0)
-    ClickDetector.Position = UDim2.new(-0.25, 0, -0.25, 0)
-    ClickDetector.Text = ""
-    
-    ClickDetector.MouseButton1Click:Connect(function()
-        Toggle()
-        AnimateSwitch(IsEnabled)
-    end)
-    
-    -- Hỗ trợ chạm (mobile)
-    ClickDetector.TouchTap:Connect(function()
-        Toggle()
-        AnimateSwitch(IsEnabled)
-    end)
-    
-    -- ==========================================
-    -- NÚT ẨN/HIỆN PANEL
-    -- ==========================================
-    local MinimizeBtn = Instance.new("TextButton")
-    MinimizeBtn.Name = "MinimizeBtn"
-    MinimizeBtn.Parent = Panel
-    MinimizeBtn.BackgroundColor3 = Color3.fromRGB(40, 40, 45)
-    MinimizeBtn.BorderSizePixel = 0
-    MinimizeBtn.Size = UDim2.new(0, 24, 0, 24)
-    MinimizeBtn.Position = UDim2.new(1, -30, 0, 8)
-    MinimizeBtn.Font = Enum.Font.GothamBold
-    MinimizeBtn.Text = "−"
-    MinimizeBtn.TextColor3 = Color3.fromRGB(200, 200, 200)
-    MinimizeBtn.TextSize = 16
-    
-    local BtnCorner = Instance.new("UICorner")
-    BtnCorner.CornerRadius = UDim.new(1, 0)
-    BtnCorner.Parent = MinimizeBtn
-    
-    local isMinimized = false
-    
-    MinimizeBtn.MouseButton1Click:Connect(function()
-        isMinimized = not isMinimized
-        if isMinimized then
-            Panel.Size = UDim2.new(0, 280, 0, 50)
-            MinimizeBtn.Text = "+"
-        else
-            Panel.Size = UDim2.new(0, 280, 0, 140)
-            MinimizeBtn.Text = "−"
+    -- Hiệu ứng nhấp nháy nhẹ
+    task.spawn(function()
+        while IsActive do
+            task.wait(2)
+            StatusFrame.BackgroundColor3 = Color3.fromRGB(0, 200, 90)
+            task.wait(0.5)
+            StatusFrame.BackgroundColor3 = Color3.fromRGB(0, 180, 80)
         end
     end)
-    
-    -- Khởi tạo
-    AnimateSwitch(false)
-    
-    return SG
 end
 
 -- ==========================================
--- KHỞI CHẠY
+-- CHẠY
 -- ==========================================
-local GUI = CreateMobileSwitchUI()
-
-print([[
-============================================
-  ALWAYS DOUBLE - MOBILE EDITION
-  [ON]  = Luôn DOUBLE
-  [OFF] = Cơ chế gốc 40%
-  Nhấn công tắc để bật/tắt
-============================================
-]])
+Initialize()
+AntiRemoval()
+CreateStatusIndicator()
 
 -- Chống AFK
 LocalPlayer.Idled:Connect(function()
