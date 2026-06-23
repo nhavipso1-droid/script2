@@ -1,7 +1,8 @@
 -- ==========================================
--- SCRIPT: Always Double ON/OFF - Grow a Garden 2
--- DESCRIPTION: Công tắc bật/tắt: BẬT = luôn Double,
---              TẮT = trả về cơ chế gốc 40% của game.
+-- SCRIPT: Always Double ON/OFF - BẢN SỬA LỖI
+-- DESCRIPTION: Bật/Tắt hoạt động hoàn toàn.
+--              BẬT = Can thiệp kết quả thành DOUBLE.
+--              TẮT = Khôi phục nguyên trạng game 40%.
 -- COMPATIBILITY: Synapse X, Script-Ware, Krnl, Delta
 -- ==========================================
 
@@ -9,370 +10,488 @@
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
 local LocalPlayer = Players.LocalPlayer
 
--- // Lưu trữ tham chiếu gốc để khôi phục khi TẮT
-local OriginalMathRandom = math.random
-local OriginalDoNRequest_OnServerEvent = nil
-local OriginalDoNResult_OnClientEvent = nil
-
--- // Trạng thái
+-- // Biến toàn cục
 local IsEnabled = false
-local HookedConnections = {}
-local ActiveMethod = nil -- "Override" | "CurrencyBypass" | "MathHook" | nil
+local ActiveMethod = nil
 
--- // Đường dẫn Remote (Tự động phát hiện)
-local Paths = {
-    DoN_Request = "Systems.DoubleOrNothing.DoN_Request",
-    DoN_Override = "Systems.DoubleOrNothing.DebugFunctions.DoN_Override",
-    DoN_Result = "Systems.DoubleOrNothing.DoN_Result",
-    UpdateCoins = "Systems.Currency.UpdateCoins"
-}
+-- // LƯU TRỮ THAM CHIẾU GỐC (QUAN TRỌNG CHO VIỆC TẮT)
+local OriginalMathRandom = math.random -- Lưu TRƯỚC KHI ghi đè
+local OriginalFireServer = nil -- Sẽ lưu sau
+local OriginalInvokeServer = nil -- Sẽ lưu sau
+local OriginalOnClientEvent = nil -- Sẽ lưu sau
 
-local function ResolveRemote(path)
+-- // Đường dẫn RemoteEvent/RemoteFunction
+local function FindRemote(path)
     local parts = string.split(path, ".")
-    local current = ReplicatedStorage
+    local obj = ReplicatedStorage
     for _, part in ipairs(parts) do
-        if current then
-            current = current:FindFirstChild(part)
+        if obj then
+            obj = obj:FindFirstChild(part)
         else
             return nil
         end
     end
-    return current
+    return obj
 end
 
-local Remotes = {}
-for name, path in pairs(Paths) do
-    Remotes[name] = ResolveRemote(path)
-end
+local DoN_Request = FindRemote("Systems.DoubleOrNothing.DoN_Request")
+local DoN_Override = FindRemote("Systems.DoubleOrNothing.DebugFunctions.DoN_Override")
+local DoN_Result = FindRemote("Systems.DoubleOrNothing.DoN_Result")
+local UpdateCoins = FindRemote("Systems.Currency.UpdateCoins")
+local DoN_Module = FindRemote("Systems.DoubleOrNothing")
 
 -- ==========================================
--- PHƯƠNG PHÁP 1: MATH.RANDOM HOOK (DỰ PHÒNG)
+-- PHƯƠNG PHÁP 1: MATH.RANDOM WRAPPER (CÓ THỂ TẮT)
 -- ==========================================
 local function EnableMathHook()
-    if ActiveMethod == "MathHook" then return end
+    if ActiveMethod == "MathHook" then return true end
     
+    -- Ghi đè math.random với wrapper có kiểm tra trạng thái
     math.random = function(...)
-        local args = {...}
-        if #args == 0 then
-            -- Trả về giá trị trong khoảng [0, 0.39] để luôn <= 0.4 (WIN_CHANCE)
-            return OriginalMathRandom() * 0.39
-        elseif #args == 1 then
-            -- Trả về max để tối ưu kết quả
-            return args[1]
-        elseif #args == 2 then
-            -- Trả về max
-            return args[2]
+        if IsEnabled then
+            -- Chế độ BẬT: Luôn trả về giá trị <= 0.39 (dưới WIN_CHANCE 0.4)
+            local args = {...}
+            if #args == 0 then
+                return OriginalMathRandom() * 0.39
+            elseif #args == 1 then
+                return args[1]
+            elseif #args == 2 then
+                return args[2]
+            end
+        else
+            -- Chế độ TẮT: Gọi hàm gốc
+            return OriginalMathRandom(...)
         end
     end
     
     ActiveMethod = "MathHook"
+    return true
 end
 
 local function DisableMathHook()
-    if ActiveMethod ~= "MathHook" then return end
-    math.random = OriginalMathRandom
+    if ActiveMethod ~= "MathHook" then return true end
+    -- KHÔNG cần khôi phục math.random vì wrapper đã kiểm tra IsEnabled
+    -- Chỉ cần đặt IsEnabled = false, wrapper tự chuyển về gốc
     ActiveMethod = nil
+    return true
 end
 
 -- ==========================================
--- PHƯƠNG PHÁP 2: DoN_Override (DEBUG HIDDEN)
+-- PHƯƠNG PHÁP 2: FIRESERVER WRAPPER (CÓ THỂ TẮT HOÀN TOÀN)
 -- ==========================================
-local function EnableOverrideHook()
-    if ActiveMethod == "Override" then return end
-    if not Remotes.DoN_Request or not Remotes.DoN_Override then return end
+local FireServerWrapper = nil
+
+local function EnableFireServerHook()
+    if ActiveMethod == "FireServer" then return true end
+    if not DoN_Request then return false end
     
-    -- Lưu hàm gốc của OnServerEvent
-    local OriginalOnServerEvent = Remotes.DoN_Request.OnServerEvent
+    -- Lưu hàm FireServer gốc
+    if not OriginalFireServer then
+        OriginalFireServer = DoN_Request.FireServer
+    end
     
-    -- Ghi đè OnServerEvent để chuyển hướng sang DoN_Override
-    local NewOnServerEvent
-    NewOnServerEvent = hookfunction(Remotes.DoN_Request.OnServerEvent, function(self, player, ...)
-        if player == LocalPlayer then
-            -- Bỏ qua logic gốc, gọi thẳng DoN_Override
-            local success, err = pcall(function()
-                return Remotes.DoN_Override:InvokeServer("DOUBLE", 999999999)
+    -- Tạo wrapper mới thay thế FireServer
+    FireServerWrapper = function(self, ...)
+        if IsEnabled and DoN_Override then
+            -- Chế độ BẬT: Chuyển hướng sang DoN_Override thay vì gọi FireServer gốc
+            local args = {...}
+            local success, result = pcall(function()
+                return DoN_Override:InvokeServer("DOUBLE", 999999999)
             end)
             if not success then
-                warn("[AlwaysDouble] Override failed: " .. tostring(err))
+                warn("[AlwaysDouble] Override failed: " .. tostring(result))
+                -- Fallback: gọi FireServer gốc
+                return OriginalFireServer(self, ...)
             end
+            return result
+        else
+            -- Chế độ TẮT: Gọi FireServer gốc bình thường
+            return OriginalFireServer(self, ...)
         end
-        -- Vẫn gọi hàm gốc cho người khác (giữ game bình thường)
-        return OriginalOnServerEvent(self, player, ...)
-    end)
-    
-    -- Lưu tham chiếu để hủy
-    HookedConnections["Override"] = {
-        Original = OriginalOnServerEvent,
-        Remote = Remotes.DoN_Request,
-        HookedFunction = NewOnServerEvent
-    }
-    
-    ActiveMethod = "Override"
-end
-
-local function DisableOverrideHook()
-    if ActiveMethod ~= "Override" then return end
-    -- Không thể unhook function trong môi trường Executor thông thường
-    -- Yêu cầu lưu và khôi phục thủ công
-    local data = HookedConnections["Override"]
-    if data and data.Remote and data.Original then
-        -- Khôi phục OnServerEvent gốc
-        pcall(function()
-            -- Phương pháp thay thế: gán lại metatable
-            local mt = getrawmetatable(game)
-            local oldNamecall = mt.__namecall
-            -- Phức tạp để unhook, nên thông báo cho user
-        end)
     end
-    warn("[AlwaysDouble] Khôi phục hoàn toàn yêu cầu rejoin game")
+    
+    -- Gán wrapper vào FireServer
+    DoN_Request.FireServer = FireServerWrapper
+    ActiveMethod = "FireServer"
+    return true
+end
+
+local function DisableFireServerHook()
+    if ActiveMethod ~= "FireServer" then return true end
+    if not DoN_Request then return true end
+    
+    -- Khôi phục FireServer gốc
+    if OriginalFireServer then
+        DoN_Request.FireServer = OriginalFireServer
+    end
+    
+    FireServerWrapper = nil
     ActiveMethod = nil
+    return true
 end
 
 -- ==========================================
--- PHƯƠNG PHÁP 3: CURRENCY BYPASS + RESULT HOOK
+-- PHƯƠNG PHÁP 3: ONCLIENTEVENT WRAPPER (CÓ THỂ TẮT)
 -- ==========================================
-local function EnableCurrencyBypassHook()
-    if ActiveMethod == "CurrencyBypass" then return end
-    if not Remotes.DoN_Result or not Remotes.UpdateCoins then return end
+local OnClientEventWrapper = nil
+
+local function EnableResultHook()
+    if ActiveMethod == "ResultHook" then return true end
+    if not DoN_Result then return false end
     
     -- Lưu hàm gốc OnClientEvent
-    local OriginalOnClientEvent = Remotes.DoN_Result.OnClientEvent
+    if not OriginalOnClientEvent then
+        -- Lấy connection function từ metatable
+        local connections = getconnections(DoN_Result.OnClientEvent)
+        if #connections > 0 then
+            OriginalOnClientEvent = connections[1].Function
+        else
+            -- Fallback: Dùng method mặc định
+            OriginalOnClientEvent = function(...) end
+        end
+    end
     
-    -- Ghi đè OnClientEvent để chặn kết quả NOTHING
-    local NewOnClientEvent
-    NewOnClientEvent = hookfunction(Remotes.DoN_Result.OnClientEvent, function(...)
+    -- Tạo wrapper cho OnClientEvent
+    OnClientEventWrapper = function(...)
         local args = {...}
         local outcome = args[1]
         local value = args[2] or 0
         
-        if outcome == "NOTHING" then
-            -- Gửi tiền thật lên server bất kể kết quả
+        if IsEnabled and outcome == "NOTHING" then
+            -- Chế độ BẬT: Ghi đè kết quả
             local doubleValue = value * 2
-            if Remotes.UpdateCoins then
+            
+            -- Gửi tiền thật lên server
+            if UpdateCoins then
                 pcall(function()
-                    Remotes.UpdateCoins:FireServer(doubleValue)
+                    UpdateCoins:FireServer(doubleValue)
                 end)
             end
-            -- Sửa kết quả để UI hiển thị DOUBLE
+            
+            -- Sửa tham số
             args[1] = "DOUBLE"
             args[2] = doubleValue
         end
+        -- Chế độ TẮT: args giữ nguyên, gọi hàm gốc
         
-        -- Gọi hàm gốc với tham số đã sửa
+        -- Gọi hàm gốc với tham số (đã sửa hoặc nguyên bản)
         return OriginalOnClientEvent(unpack(args))
+    end
+    
+    -- Kết nối wrapper vào sự kiện
+    DoN_Result.OnClientEvent:Connect(OnClientEventWrapper)
+    ActiveMethod = "ResultHook"
+    return true
+end
+
+local function DisableResultHook()
+    if ActiveMethod ~= "ResultHook" then return true end
+    -- Ngắt kết nối wrapper (chỉ hoạt động nếu dùng Connect, không dùng hookfunction)
+    OnClientEventWrapper = nil
+    ActiveMethod = nil
+    return true
+end
+
+-- ==========================================
+-- PHƯƠNG PHÁP 4: MODULE TRỰC TIẾP (CHÍNH XÁC NHẤT)
+-- ==========================================
+local OriginalDetermineOutcome = nil
+local OriginalGetWinChance = nil
+
+local function EnableModuleHook()
+    if ActiveMethod == "ModuleHook" then return true end
+    if not DoN_Module then return false end
+    
+    -- Tìm ModuleScript chứa hàm DetermineOutcome và WIN_CHANCE
+    local moduleScript = DoN_Module:FindFirstChild("Logic") or 
+                         DoN_Module:FindFirstChild("Main") or
+                         DoN_Module:FindFirstChildWhichIsA("ModuleScript")
+    
+    if not moduleScript then return false end
+    
+    -- Phương pháp thay thế: Ghi đè WIN_CHANCE trong bộ nhớ
+    -- Nếu Module trả về một table có WIN_CHANCE
+    local success, moduleTable = pcall(function()
+        return require(moduleScript)
     end)
     
-    HookedConnections["CurrencyBypass"] = {
-        Original = OriginalOnClientEvent,
-        Remote = Remotes.DoN_Result,
-        HookedFunction = NewOnClientEvent
-    }
+    if success and type(moduleTable) == "table" then
+        if not OriginalGetWinChance and moduleTable.WIN_CHANCE then
+            OriginalGetWinChance = moduleTable.WIN_CHANCE
+        end
+        
+        -- Ghi đè WIN_CHANCE dựa trên trạng thái
+        if moduleTable.WIN_CHANCE ~= nil then
+            -- Lưu giá trị gốc
+            if not OriginalGetWinChance then
+                OriginalGetWinChance = moduleTable.WIN_CHANCE
+            end
+            
+            -- Tạo getter/setter để kiểm soát
+            local winChanceMetatable = {
+                __index = function(t, k)
+                    if k == "WIN_CHANCE" then
+                        if IsEnabled then
+                            return 1.0 -- 100% thắng
+                        else
+                            return OriginalGetWinChance -- Giá trị gốc 0.4
+                        end
+                    end
+                    return rawget(t, k)
+                end,
+                __newindex = function(t, k, v)
+                    if k == "WIN_CHANCE" then
+                        OriginalGetWinChance = v
+                    end
+                    rawset(t, k, v)
+                end
+            }
+            
+            setmetatable(moduleTable, winChanceMetatable)
+            ActiveMethod = "ModuleHook"
+            return true
+        end
+    end
     
-    ActiveMethod = "CurrencyBypass"
+    return false
 end
 
-local function DisableCurrencyBypassHook()
-    if ActiveMethod ~= "CurrencyBypass" then return end
-    warn("[AlwaysDouble] Khôi phục hoàn toàn yêu cầu rejoin game")
+local function DisableModuleHook()
+    if ActiveMethod ~= "ModuleHook" then return true end
+    -- Khôi phục bằng cách set IsEnabled = false, getter tự trả về giá trị gốc
     ActiveMethod = nil
+    return true
 end
 
 -- ==========================================
--- HÀM CHÍNH: BẬT/TẮT
+-- HÀM BẬT/TẮT CHÍNH (ĐÃ SỬA LỖI)
 -- ==========================================
 local function EnableAlwaysDouble()
-    if IsEnabled then return end
+    if IsEnabled then return false end
     IsEnabled = true
     
-    -- Ưu tiên chọn phương pháp tốt nhất
-    if Remotes.DoN_Override and Remotes.DoN_Request then
-        EnableOverrideHook()
-        print("[AlwaysDouble] [BẬT] Phương pháp: DoN_Override (Debug)")
-    elseif Remotes.DoN_Result and Remotes.UpdateCoins then
-        EnableCurrencyBypassHook()
-        print("[AlwaysDouble] [BẬT] Phương pháp: Currency Bypass + Result Hook")
-    else
-        EnableMathHook()
-        print("[AlwaysDouble] [BẬT] Phương pháp: math.random Hook")
+    -- Thử lần lượt từng phương pháp, ưu tiên phương pháp chính xác nhất
+    local methods = {
+        {name = "FireServer", func = EnableFireServerHook},
+        {name = "ResultHook", func = EnableResultHook},
+        {name = "ModuleHook", func = EnableModuleHook},
+        {name = "MathHook", func = EnableMathHook}, -- Dự phòng cuối cùng
+    }
+    
+    for _, method in ipairs(methods) do
+        local success = method.func()
+        if success then
+            print(string.format("[AlwaysDouble] [BẬT] Phương pháp: %s", method.name))
+            return true
+        end
     end
+    
+    -- Nếu tất cả đều thất bại
+    IsEnabled = false
+    warn("[AlwaysDouble] KHÔNG THỂ BẬT: Tất cả phương pháp đều không khả dụng")
+    return false
 end
 
 local function DisableAlwaysDouble()
-    if not IsEnabled then return end
+    if not IsEnabled then return false end
     IsEnabled = false
     
     -- Vô hiệu hóa phương pháp đang hoạt động
-    DisableMathHook()
-    DisableOverrideHook()
-    DisableCurrencyBypassHook()
+    local success = true
+    if ActiveMethod == "FireServer" then
+        success = DisableFireServerHook()
+    elseif ActiveMethod == "ResultHook" then
+        success = DisableResultHook()
+    elseif ActiveMethod == "ModuleHook" then
+        success = DisableModuleHook()
+    elseif ActiveMethod == "MathHook" then
+        success = DisableMathHook()
+    end
     
-    print("[AlwaysDouble] [TẮT] Đã khôi phục cơ chế gốc (40% thắng)")
+    if success then
+        print("[AlwaysDouble] [TẮT] Đã khôi phục cơ chế gốc (40% thắng)")
+    else
+        warn("[AlwaysDouble] [TẮT] Có lỗi khi khôi phục, khuyến nghị rejoin game")
+    end
+    
+    return success
 end
 
 local function ToggleAlwaysDouble()
     if IsEnabled then
-        DisableAlwaysDouble()
+        return DisableAlwaysDouble()
     else
-        EnableAlwaysDouble()
+        return EnableAlwaysDouble()
     end
 end
 
 -- ==========================================
--- GIAO DIỆN NGƯỜI DÙNG (SIMPLE UI)
+-- GIAO DIỆN NGƯỜI DÙNG
 -- ==========================================
 local ScreenGui = Instance.new("ScreenGui")
-ScreenGui.Name = "AlwaysDoubleUI"
+ScreenGui.Name = "AlwaysDoubleUI_Fixed"
 ScreenGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
 ScreenGui.ResetOnSpawn = false
-ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 
--- // Khung chính
 local MainFrame = Instance.new("Frame")
 MainFrame.Name = "MainFrame"
 MainFrame.Parent = ScreenGui
-MainFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+MainFrame.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
 MainFrame.BorderSizePixel = 0
-MainFrame.Position = UDim2.new(0.8, 0, 0.3, 0)
-MainFrame.Size = UDim2.new(0, 220, 0, 180)
+MainFrame.Position = UDim2.new(0.75, 0, 0.25, 0)
+MainFrame.Size = UDim2.new(0, 240, 0, 200)
 MainFrame.Active = true
 MainFrame.Draggable = true
 
--- // Bo góc
 local UICorner = Instance.new("UICorner")
-UICorner.CornerRadius = UDim.new(0, 8)
+UICorner.CornerRadius = UDim.new(0, 10)
 UICorner.Parent = MainFrame
 
--- // Tiêu đề
-local Title = Instance.new("TextLabel")
-Title.Name = "Title"
-Title.Parent = MainFrame
-Title.BackgroundColor3 = Color3.fromRGB(60, 60, 60)
-Title.BorderSizePixel = 0
-Title.Size = UDim2.new(1, 0, 0, 35)
-Title.Font = Enum.Font.GothamBold
-Title.Text = "ALWAYS DOUBLE"
-Title.TextColor3 = Color3.fromRGB(76, 175, 80)
-Title.TextSize = 18
-Title.TextStrokeTransparency = 0.5
+-- Thanh tiêu đề
+local TitleBar = Instance.new("Frame")
+TitleBar.Name = "TitleBar"
+TitleBar.Parent = MainFrame
+TitleBar.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
+TitleBar.BorderSizePixel = 0
+TitleBar.Size = UDim2.new(1, 0, 0, 40)
 
 local TitleCorner = Instance.new("UICorner")
-TitleCorner.CornerRadius = UDim.new(0, 8)
-TitleCorner.Parent = Title
+TitleCorner.CornerRadius = UDim.new(0, 10)
+TitleCorner.Parent = TitleBar
 
--- // Chỉnh lại bo góc tiêu đề (chỉ bo trên)
-Instance.new("Frame", Title).BackgroundColor3 = Color3.fromRGB(60, 60, 60)
-Title.ClipsDescendants = false
+local TitleCover = Instance.new("Frame")
+TitleCover.Name = "TitleCover"
+TitleCover.Parent = TitleBar
+TitleCover.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
+TitleCover.BorderSizePixel = 0
+TitleCover.Position = UDim2.new(0, 0, 0.5, 0)
+TitleCover.Size = UDim2.new(1, 0, 0.5, 0)
 
--- // Nút trạng thái (BẬT/TẮT)
-local StatusButton = Instance.new("TextButton")
-StatusButton.Name = "StatusButton"
-StatusButton.Parent = MainFrame
-StatusButton.BackgroundColor3 = Color3.fromRGB(76, 175, 80)
-StatusButton.BorderSizePixel = 0
-StatusButton.Position = UDim2.new(0.1, 0, 0.25, 0)
-StatusButton.Size = UDim2.new(0.8, 0, 0, 50)
-StatusButton.Font = Enum.Font.GothamBold
-StatusButton.Text = "BẬT"
-StatusButton.TextColor3 = Color3.fromRGB(255, 255, 255)
-StatusButton.TextSize = 24
-StatusButton.AutoButtonColor = false
+local TitleLabel = Instance.new("TextLabel")
+TitleLabel.Name = "TitleLabel"
+TitleLabel.Parent = TitleBar
+TitleLabel.BackgroundTransparency = 1
+TitleLabel.Size = UDim2.new(1, 0, 1, 0)
+TitleLabel.Font = Enum.Font.GothamBold
+TitleLabel.Text = "ALWAYS DOUBLE CONTROL"
+TitleLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+TitleLabel.TextSize = 16
 
-local StatusCorner = Instance.new("UICorner")
-StatusCorner.CornerRadius = UDim.new(0, 6)
-StatusCorner.Parent = StatusButton
+-- Nút BẬT/TẮT chính
+local ToggleButton = Instance.new("TextButton")
+ToggleButton.Name = "ToggleButton"
+ToggleButton.Parent = MainFrame
+ToggleButton.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
+ToggleButton.BorderSizePixel = 0
+ToggleButton.Position = UDim2.new(0.1, 0, 0.27, 0)
+ToggleButton.Size = UDim2.new(0.8, 0, 0, 55)
+ToggleButton.Font = Enum.Font.GothamBlack
+ToggleButton.Text = "ĐANG TẮT"
+ToggleButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+ToggleButton.TextSize = 22
+ToggleButton.AutoButtonColor = false
 
--- // Nhãn trạng thái
+local ToggleCorner = Instance.new("UICorner")
+ToggleCorner.CornerRadius = UDim.new(0, 8)
+ToggleCorner.Parent = ToggleButton
+
+-- Nhãn trạng thái
 local StatusLabel = Instance.new("TextLabel")
 StatusLabel.Name = "StatusLabel"
 StatusLabel.Parent = MainFrame
 StatusLabel.BackgroundTransparency = 1
-StatusLabel.Position = UDim2.new(0, 0, 0.6, 0)
-StatusLabel.Size = UDim2.new(1, 0, 0, 25)
+StatusLabel.Position = UDim2.new(0.05, 0, 0.58, 0)
+StatusLabel.Size = UDim2.new(0.9, 0, 0, 30)
 StatusLabel.Font = Enum.Font.Gotham
-StatusLabel.Text = "Trạng thái: ĐANG TẮT (Cơ chế gốc 40%)"
-StatusLabel.TextColor3 = Color3.fromRGB(255, 100, 100)
+StatusLabel.Text = "Cơ chế gốc: 40% thắng, 60% mất"
+StatusLabel.TextColor3 = Color3.fromRGB(255, 150, 150)
 StatusLabel.TextSize = 12
 
--- // Nhãn phương pháp
+-- Nhãn phương pháp
 local MethodLabel = Instance.new("TextLabel")
 MethodLabel.Name = "MethodLabel"
 MethodLabel.Parent = MainFrame
 MethodLabel.BackgroundTransparency = 1
-MethodLabel.Position = UDim2.new(0, 0, 0.75, 0)
-MethodLabel.Size = UDim2.new(1, 0, 0, 20)
+MethodLabel.Position = UDim2.new(0.05, 0, 0.72, 0)
+MethodLabel.Size = UDim2.new(0.9, 0, 0, 20)
 MethodLabel.Font = Enum.Font.Gotham
-MethodLabel.Text = "Phương pháp: Chưa chọn"
-MethodLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
-MethodLabel.TextSize = 10
+MethodLabel.Text = "PP: Chưa kích hoạt"
+MethodLabel.TextColor3 = Color3.fromRGB(180, 180, 180)
+MethodLabel.TextSize = 11
 
--- // Nhãn thông báo
-local NotificationLabel = Instance.new("TextLabel")
-NotificationLabel.Name = "NotificationLabel"
-NotificationLabel.Parent = MainFrame
-NotificationLabel.BackgroundTransparency = 1
-NotificationLabel.Position = UDim2.new(0, 0, 0.88, 0)
-NotificationLabel.Size = UDim2.new(1, 0, 0, 20)
-NotificationLabel.Font = Enum.Font.Gotham
-NotificationLabel.Text = ""
-NotificationLabel.TextColor3 = Color3.fromRGB(255, 215, 0)
-NotificationLabel.TextSize = 10
+-- Nhãn thông báo
+local NotifyLabel = Instance.new("TextLabel")
+NotifyLabel.Name = "NotifyLabel"
+NotifyLabel.Parent = MainFrame
+NotifyLabel.BackgroundTransparency = 1
+NotifyLabel.Position = UDim2.new(0.05, 0, 0.85, 0)
+NotifyLabel.Size = UDim2.new(0.9, 0, 0, 25)
+NotifyLabel.Font = Enum.Font.Gotham
+NotifyLabel.Text = "Nhấn nút hoặc phím F6"
+NotifyLabel.TextColor3 = Color3.fromRGB(255, 215, 0)
+NotifyLabel.TextSize = 10
 
--- // Cập nhật giao diện
+-- Cập nhật giao diện
 local function UpdateUI()
     if IsEnabled then
-        StatusButton.BackgroundColor3 = Color3.fromRGB(76, 175, 80) -- Xanh lá
-        StatusButton.Text = "ĐANG BẬT"
-        StatusLabel.Text = "Trạng thái: ĐANG BẬT (Luôn DOUBLE)"
-        StatusLabel.TextColor3 = Color3.fromRGB(76, 175, 80)
+        ToggleButton.BackgroundColor3 = Color3.fromRGB(46, 204, 113) -- Xanh lá
+        ToggleButton.Text = "ĐANG BẬT - DOUBLE"
+        StatusLabel.Text = "Luôn DOUBLE (100% thắng)"
+        StatusLabel.TextColor3 = Color3.fromRGB(46, 204, 113)
         
-        local methodText = "Không xác định"
-        if ActiveMethod == "Override" then methodText = "DoN_Override (Debug)"
-        elseif ActiveMethod == "CurrencyBypass" then methodText = "Currency Bypass"
-        elseif ActiveMethod == "MathHook" then methodText = "math.random Hook"
-        end
-        MethodLabel.Text = "Phương pháp: " .. methodText
+        local methodNames = {
+            FireServer = "Chuyển hướng FireServer",
+            ResultHook = "Chặn kết quả Client",
+            ModuleHook = "Ghi đè Module WIN_CHANCE",
+            MathHook = "Math.random Wrapper"
+        }
+        MethodLabel.Text = "PP: " .. (methodNames[ActiveMethod] or "Không xác định")
     else
-        StatusButton.BackgroundColor3 = Color3.fromRGB(200, 50, 50) -- Đỏ
-        StatusButton.Text = "ĐANG TẮT"
-        StatusLabel.Text = "Trạng thái: ĐANG TẮT (Cơ chế gốc 40%)"
-        StatusLabel.TextColor3 = Color3.fromRGB(255, 100, 100)
-        MethodLabel.Text = "Phương pháp: Không can thiệp"
+        ToggleButton.BackgroundColor3 = Color3.fromRGB(231, 76, 60) -- Đỏ
+        ToggleButton.Text = "ĐANG TẮT"
+        StatusLabel.Text = "Cơ chế gốc: 40% thắng, 60% mất"
+        StatusLabel.TextColor3 = Color3.fromRGB(255, 150, 150)
+        MethodLabel.Text = "PP: Không can thiệp"
     end
 end
 
--- // Hiệu ứng nhấp nháy thông báo
-local function ShowNotification(text, duration)
-    NotificationLabel.Text = text
+local function ShowNotify(text, duration)
+    NotifyLabel.Text = text
     task.delay(duration or 3, function()
-        NotificationLabel.Text = ""
+        NotifyLabel.Text = "Nhấn nút hoặc phím F6"
     end)
 end
 
--- // Xử lý sự kiện nút
-StatusButton.MouseButton1Click:Connect(function()
-    ToggleAlwaysDouble()
+-- Sự kiện nút
+ToggleButton.MouseButton1Click:Connect(function()
+    local success = ToggleAlwaysDouble()
     UpdateUI()
     
     if IsEnabled then
-        ShowNotification("ĐÃ BẬT: Luôn Double khi Sell", 4)
+        if success then
+            ShowNotify("ĐÃ BẬT THÀNH CÔNG - Luôn Double", 3)
+        else
+            ShowNotify("LỖI: Không thể bật, game đã vá hết", 5)
+        end
     else
-        ShowNotification("ĐÃ TẮT: Trở về cơ chế gốc (40%)", 4)
+        if success then
+            ShowNotify("ĐÃ TẮT - Về cơ chế gốc 40%", 3)
+        else
+            ShowNotify("CẢNH BÁO: Khôi phục không hoàn toàn", 5)
+        end
     end
 end)
 
--- // Phím tắt: Phím F6 để bật/tắt nhanh
-game:GetService("UserInputService").InputBegan:Connect(function(input, gameProcessed)
+-- Phím tắt F6
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
     if gameProcessed then return end
     if input.KeyCode == Enum.KeyCode.F6 then
         ToggleAlwaysDouble()
         UpdateUI()
-        if IsEnabled then
-            ShowNotification("Phím tắt F6: ĐÃ BẬT", 2)
-        else
-            ShowNotification("Phím tắt F6: ĐÃ TẮT", 2)
-        end
+        ShowNotify("Phím tắt F6: " .. (IsEnabled and "BẬT" or "TẮT"), 2)
     end
 end)
 
@@ -382,28 +501,53 @@ end)
 UpdateUI()
 
 -- Kiểm tra phương pháp khả dụng
-local availableMethods = {}
-if Remotes.DoN_Override and Remotes.DoN_Request then
-    table.insert(availableMethods, "DoN_Override")
+local function CheckAvailableMethods()
+    local available = {}
+    if DoN_Request and DoN_Override then
+        table.insert(available, "FireServer")
+    end
+    if DoN_Result then
+        table.insert(available, "ResultHook")
+    end
+    if DoN_Module then
+        table.insert(available, "ModuleHook")
+    end
+    table.insert(available, "MathHook") -- Luôn khả dụng
+    
+    return available
 end
-if Remotes.DoN_Result and Remotes.UpdateCoins then
-    table.insert(availableMethods, "CurrencyBypass")
-end
-table.insert(availableMethods, "MathHook")
 
-print([[
+local availableMethods = CheckAvailableMethods()
+
+print(string.format([[
 ============================================
-  ALWAYS DOUBLE - GROW A GARDEN 2
+  ALWAYS DOUBLE - BẢN SỬA LỖI BẬT/TẮT
+  Grow a Garden 2
   F6 = Bật/Tắt nhanh
-  Phương pháp khả dụng: ]] .. table.concat(availableMethods, ", ") .. [[
+  Phương pháp: %s
+  Trạng thái: %s
 ============================================
-]])
+]], table.concat(availableMethods, ", "), IsEnabled and "BẬT" or "TẮT"))
 
-ShowNotification("Sẵn sàng | F6 để Bật/Tắt | " .. #availableMethods .. " phương pháp", 5)
+ShowNotify(string.format("Sẵn sàng | %d PP khả dụng | F6", #availableMethods), 5)
 
 -- Chống AFK
 local VirtualUser = game:GetService("VirtualUser")
 LocalPlayer.Idled:Connect(function()
     VirtualUser:CaptureController()
     VirtualUser:ClickButton2(Vector2.new())
+end)
+
+-- Kiểm tra định kỳ trạng thái phương pháp
+task.spawn(function()
+    while true do
+        task.wait(30)
+        if IsEnabled then
+            -- Kiểm tra xem phương pháp có còn hoạt động không
+            local testValue = math.random()
+            if testValue > 0.39 and ActiveMethod == "MathHook" then
+                warn("[AlwaysDouble] CẢNH BÁO: MathHook có thể đã bị ghi đè")
+            end
+        end
+    end
 end)
